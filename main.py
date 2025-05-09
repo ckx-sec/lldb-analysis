@@ -61,7 +61,7 @@ print("\n--- Test Script Finished (LLDB Import Check) ---")
 
 g_temp_blr_x8_bp_context = {}
 g_blr_x8_hit_log = [] 
-MAX_RECURSION_DEPTH = 3
+MAX_RECURSION_DEPTH = 15
 g_scanned_function_starts = set()
 
 def is_process_effectively_dead(process_obj):
@@ -346,7 +346,7 @@ def set_breakpoints_on_all_exported_functions(debugger, target, lib_name):
 
 
 def scan_and_set_blr_x8_breakpoints(target, frame, function_symbol, func_info, recursion_depth=0):
-    global g_temp_blr_x8_bp_context, g_scanned_function_starts # <--- 引用新增的全局变量
+    global g_temp_blr_x8_bp_context, g_scanned_function_starts
 
     func_name = func_info['name']
 
@@ -363,7 +363,6 @@ def scan_and_set_blr_x8_breakpoints(target, frame, function_symbol, func_info, r
         #print(f"[WARN] (Depth {recursion_depth}) Function {func_name}: Load address for start is invalid. Cannot scan.")
         return
 
-    # 检查是否已扫描过此函数，避免重复工作
     if func_start_load_addr_int in g_scanned_function_starts:
         #print(f"[DEBUG] (Depth {recursion_depth}) Function {func_name} at 0x{func_start_load_addr_int:x} already scanned for branches. Skipping.")
         return
@@ -372,11 +371,7 @@ def scan_and_set_blr_x8_breakpoints(target, frame, function_symbol, func_info, r
     if not containing_module or not containing_module.IsValid():
         sym_name_for_warn = function_symbol.GetName()
         #print(f"[WARN] (Depth {recursion_depth}) Function {func_name} (Symbol: {sym_name_for_warn}): Could not get valid module from symbol's address object.")
-        # We can still proceed if we have a valid func_start_load_addr_int and size, module info is for context.
-        # However, module_base_addr_int calculation will fail.
-        # For BLR X8 offset calculation, module base is important. For BL target resolution, not directly.
-        # Let's allow proceeding but be aware that offset calculations might be affected for BLR X8.
-        pass # Allow scan if module determination fails but addresses are fine
+        pass
 
     containing_module_name = "UnknownModuleFromSymbol"
     module_base_addr_int = lldb.LLDB_INVALID_ADDRESS
@@ -388,7 +383,6 @@ def scan_and_set_blr_x8_breakpoints(target, frame, function_symbol, func_info, r
         if module_base_addr_int == lldb.LLDB_INVALID_ADDRESS:
             #print(f"[WARN] (Depth {recursion_depth}) Function {func_name} in module '{containing_module_name}': Could not determine module base address. Offsets for BLR X8 might not be calculated for this scan.")
             pass
-            # continue with scan, but blr x8 context might lack offsets
 
     func_end_addr_obj_from_symbol = function_symbol.GetEndAddress()
     if not func_end_addr_obj_from_symbol.IsValid():
@@ -417,7 +411,7 @@ def scan_and_set_blr_x8_breakpoints(target, frame, function_symbol, func_info, r
     else:
         blr_x8_sequence = b'\x00\x01\x3f\xd6'
         found_blr_x8_count = 0
-        for i in range(0, func_size - 3, 4): # ARM64 instructions are 4 bytes
+        for i in range(0, func_size - 3, 4):
             instruction_bytes = instructions_data_raw[i:i+4]
             if instruction_bytes == blr_x8_sequence:
                 blr_actual_load_addr_int = func_start_load_addr_int + i
@@ -431,14 +425,13 @@ def scan_and_set_blr_x8_breakpoints(target, frame, function_symbol, func_info, r
                     offset_original_func_addr_str = hex(offset_original_func_addr)
                     offset_blr_instr_addr_str = hex(offset_blr_instr_addr)
 
-
                 #print(f"[DEBUG] (Depth {recursion_depth}) Found 'blr x8' in {containing_module_name}::{func_name} at Abs: 0x{blr_actual_load_addr_int:x} (Offset: +{offset_blr_instr_addr_str})")
 
                 is_duplicate_context = False
                 for existing_bp_id, existing_ctx in g_temp_blr_x8_bp_context.items():
                     if (existing_ctx.get("module_name") == containing_module_name and
                         existing_ctx.get("original_func_name") == func_name and
-                        existing_ctx.get("original_func_addr_offset") == offset_original_func_addr_str and # Use stringified hex offset
+                        existing_ctx.get("original_func_addr_offset") == offset_original_func_addr_str and
                         existing_ctx.get("blr_instr_addr_offset") == offset_blr_instr_addr_str):
                         #print(f"[INFO] (Depth {recursion_depth}) Duplicate 'blr x8' context: Mod: {containing_module_name}, Func: {func_name}+{offset_original_func_addr_str}, BLR: +{offset_blr_instr_addr_str}. Already tracked. Skipping.")
                         is_duplicate_context = True
@@ -454,18 +447,17 @@ def scan_and_set_blr_x8_breakpoints(target, frame, function_symbol, func_info, r
                         "original_func_name": func_name,
                         "original_func_addr_offset": offset_original_func_addr_str,
                         "blr_instr_addr_offset": offset_blr_instr_addr_str,
-                        "recursion_depth": recursion_depth # Depth at which this blr x8 was found
+                        "recursion_depth": recursion_depth
                     }
                     #print(f"[DEBUG] (Depth {recursion_depth}) Set PERSISTENT breakpoint ID {bp_id} for 'blr x8' in {containing_module_name}::{func_name} at Abs: 0x{blr_actual_load_addr_int:x} (Offset: +{offset_blr_instr_addr_str})")
                 else:
                     #print(f"[WARN] (Depth {recursion_depth}) Failed to create breakpoint for 'blr x8' in {containing_module_name}::{func_name} at Abs: 0x{blr_actual_load_addr_int:x}")
                     pass
-        if found_blr_x8_count == 0 and error.Success() : # Only print if memory read was successful
+        if found_blr_x8_count == 0 and error.Success() :
             #print(f"[DEBUG] (Depth {recursion_depth}) No 'blr x8' instructions found in {containing_module_name}::{func_name}.")
             pass
 
     # 2. 扫描 BL 指令 (使用 LLDB 反汇编)
-    # SBAddress object for the start of the function is func_start_addr_obj_from_symbol
     instructions_list = target.ReadInstructions(func_start_addr_obj_from_symbol, func_size)
     if not instructions_list or instructions_list.GetSize() == 0:
         #print(f"[WARN] (Depth {recursion_depth}) Function {func_name}: Failed to read instructions using target.ReadInstructions for BL scan, or no instructions found.")
@@ -479,79 +471,66 @@ def scan_and_set_blr_x8_breakpoints(target, frame, function_symbol, func_info, r
                 continue
 
             instr_load_addr_int = instr.GetAddress().GetLoadAddress(target)
-            # 检查是否是 BL 指令 (opcode: 100101xx...)
-            # 获取指令的原始字节数据
             instr_data_reader = instr.GetData(target)
             error_instr_data = lldb.SBError()
             raw_instr_uint32 = instr_data_reader.GetUnsignedInt32(error_instr_data, 0)
 
-            if error_instr_data.Success() and (raw_instr_uint32 & 0xFC000000) == 0x94000000:
+            if error_instr_data.Success() and (raw_instr_uint32 & 0xFC000000) == 0x94000000: # Check for BL
                 bl_found_count += 1
-                # 是 BL 指令, 计算跳转目标地址
-                # 26-bit signed immediate, scaled by 4
-                offset = raw_instr_uint32 & 0x03FFFFFF  # Extract 26-bit immediate
-                # Sign extend from 26 bits
-                if (offset >> 25) & 1:  # Check the 25th bit (sign bit of the 26-bit immediate)
-                    # Python handles large negative numbers automatically with bitwise ops if needed,
-                    # but direct arithmetic after conversion to signed is cleaner.
-                    # Convert to signed 26-bit value
-                    if offset & (1 << 25): # If sign bit is set
+                offset = raw_instr_uint32 & 0x03FFFFFF
+                if (offset >> 25) & 1:
+                    if offset & (1 << 25):
                         signed_offset = offset - (1 << 26)
                     else:
-                        signed_offset = offset
-                else: # Already positive
+                        signed_offset = offset # Should not happen if (offset >> 25) & 1 is true
+                else:
                     signed_offset = offset
 
                 bl_target_addr_int = instr_load_addr_int + (signed_offset * 4)
 
-                #print(f"[DEBUG] (Depth {recursion_depth}) Found 'bl' in {containing_module_name}::{func_name} at 0x{instr_load_addr_int:x} targeting 0x{bl_target_addr_int:x}")
+                # --- MODIFICATION START ---
+                # 原递归扫描逻辑 (步骤 6) 已被移除。
+                # 现在直接在 BL 指令的目标地址设置断点。
 
-                if recursion_depth < MAX_RECURSION_DEPTH:
-                    target_addr_sbaddr = target.ResolveLoadAddress(bl_target_addr_int)
-                    if not target_addr_sbaddr or not target_addr_sbaddr.IsValid():
-                        #print(f"[DEBUG] (Depth {recursion_depth}) BL target 0x{bl_target_addr_int:x} is not a valid load address. Skipping recursive scan.")
-                        continue
+                print(f"[DEBUG] (Depth {recursion_depth}) Found 'bl' in {containing_module_name}::{func_name} at 0x{instr_load_addr_int:x} targeting 0x{bl_target_addr_int:x}. Setting breakpoint.")
+                
+                bl_target_bp = target.BreakpointCreateByAddress(bl_target_addr_int)
+                if bl_target_bp and bl_target_bp.IsValid() and bl_target_bp.GetNumLocations() > 0:
+                    actual_bp_addr_bl_target = bl_target_bp.GetLocationAtIndex(0).GetAddress().GetLoadAddress(target)
+                    
+                    target_desc_for_log = f"0x{actual_bp_addr_bl_target:x}"
+                    target_addr_sbaddr_for_log = target.ResolveLoadAddress(actual_bp_addr_bl_target)
+                    if target_addr_sbaddr_for_log and target_addr_sbaddr_for_log.IsValid():
+                        target_symbol_for_log = target_addr_sbaddr_for_log.GetSymbol()
+                        target_module_name_for_log = "UnknownModule" # Default
+                        target_func_name_for_log_part = f"sub_{actual_bp_addr_bl_target:x}" # Default
 
-                    target_symbol = target_addr_sbaddr.GetSymbol()
+                        target_module_obj_for_log = target_addr_sbaddr_for_log.GetModule()
+                        if target_module_obj_for_log and target_module_obj_for_log.IsValid():
+                            mod_name_val = target_module_obj_for_log.GetFileSpec().GetFilename()
+                            if mod_name_val: target_module_name_for_log = mod_name_val
+                            else: target_module_name_for_log = "UnnamedModule"
+                        
+                        if target_symbol_for_log and target_symbol_for_log.IsValid():
+                            func_name_val = target_symbol_for_log.GetName()
+                            if func_name_val: target_func_name_for_log_part = func_name_val
+                        
+                        target_desc_for_log = f"{target_module_name_for_log}::{target_func_name_for_log_part} (0x{actual_bp_addr_bl_target:x})"
 
-                    if target_symbol and target_symbol.IsValid() and \
-                       target_symbol.GetStartAddress().GetLoadAddress(target) == bl_target_addr_int:
-                        # 目标是另一个函数的起始点
-                        target_func_name_rec = target_symbol.GetName()
-                        if not target_func_name_rec: target_func_name_rec = f"sub_{bl_target_addr_int:x}"
-
-                        target_module_obj = target_addr_sbaddr.GetModule()
-                        target_module_name_rec = "UnknownTargetModule"
-                        if target_module_obj and target_module_obj.IsValid():
-                            target_module_name_rec = target_module_obj.GetFileSpec().GetFilename()
-                            if not target_module_name_rec: target_module_name_rec = "UnnamedTargetModule"
-
-                        #print(f"[DEBUG] (Depth {recursion_depth}) 'bl' target 0x{bl_target_addr_int:x} is start of function: {target_module_name_rec}::{target_func_name_rec}. Recursive scan (depth {recursion_depth + 1}).")
-
-                        recursive_func_info = {
-                            "name": target_func_name_rec,
-                            "address": bl_target_addr_int, # Absolute load address
-                            "module_name": target_module_name_rec
-                        }
-                        # 递归调用自身进行扫描
-                        scan_and_set_blr_x8_breakpoints(target, frame, target_symbol, recursive_func_info, recursion_depth + 1)
-                    else:
-                        s_name = target_symbol.GetName() if target_symbol and target_symbol.IsValid() else "NoSymbol"
-                        s_start = target_symbol.GetStartAddress().GetLoadAddress(target) if target_symbol and target_symbol.IsValid() and target_symbol.GetStartAddress().IsValid() else "N/A"
-                        #print(f"[DEBUG] (Depth {recursion_depth}) 'bl' target 0x{bl_target_addr_int:x} is not a function start (Symbol: {s_name}, Starts at: {s_start if isinstance(s_start, int) else s_start}). Skipping recursive scan.")
-                        pass
-                elif recursion_depth >= MAX_RECURSION_DEPTH:
-                    #print(f"[DEBUG] (Depth {recursion_depth}) Max recursion depth reached for 'bl' target 0x{bl_target_addr_int:x} from 0x{instr_load_addr_int:x}. Stopping this path.")
-                    pass
+                    #print(f"[DEBUG] (Depth {recursion_depth}) BL from {containing_module_name}::{func_name} (0x{instr_load_addr_int:x}) targets {target_desc_for_log}. Set breakpoint ID {bl_target_bp.GetID()}.")
+                    # 注意: 这些为 BL 目标设置的断点目前没有被添加到任何全局追踪列表 (如 g_temp_blr_x8_bp_context)。
+                    # 如果这些断点被命中，它们可能会被主事件循环中处理未追踪断点的 'else' 分支捕获。
+                else:
+                    print(f"[WARN] (Depth {recursion_depth}) Failed to create breakpoint for BL target at 0x{bl_target_addr_int:x} from {containing_module_name}::{func_name} (0x{instr_load_addr_int:x}). BP Valid: {bl_target_bp.IsValid() if bl_target_bp else 'None'}, NumLoc: {bl_target_bp.GetNumLocations() if bl_target_bp else 'N/A'}")
+                # --- MODIFICATION END ---
 
         if bl_found_count == 0 and instructions_list and instructions_list.GetSize() > 0:
-            #print(f"[DEBUG] (Depth {recursion_depth}) No 'bl' instructions found in {containing_module_name}::{func_name}.")
+            print(f"[DEBUG] (Depth {recursion_depth}) No 'bl' instructions found in {containing_module_name}::{func_name}.")
             pass
 
-    # 标记此函数已扫描
     g_scanned_function_starts.add(func_start_load_addr_int)
     #print(f"[DEBUG] (Depth {recursion_depth}) Finished scanning {containing_module_name}::{func_name} at 0x{func_start_load_addr_int:x}. Added to scanned set.")
-    
+
 def attach_and_debug_remote(pid: int, target_lib_name: str, device_serial: str, connect_url="connect://localhost:1234"):
     global g_temp_blr_x8_bp_context, g_blr_x8_hit_log 
     global MAX_RECURSION_DEPTH
@@ -913,7 +892,7 @@ def attach_and_debug_remote(pid: int, target_lib_name: str, device_serial: str, 
                             continue 
                         
                         else: 
-                            print(f"[WARN] Hit truly untracked breakpoint (Reported ID: {bp_id_hit}, Abs Addr: 0x{pc_address_of_stop_int:x}). Auto-continuing...")
+                            #print(f"[WARN] Hit truly untracked breakpoint (Reported ID: {bp_id_hit}, Abs Addr: 0x{pc_address_of_stop_int:x}). Auto-continuing...")
                             if process.IsValid() and not is_process_effectively_dead(process): process.Continue()
                             continue
                     
