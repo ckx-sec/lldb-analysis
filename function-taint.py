@@ -533,11 +533,41 @@ def trace_taint_in_function(
                                 target_formal_param = ordered_callee_formal_params[conceptual_arg_index]
                                 hv_to_taint_in_callee = None
                                 try:
-                                    # Get the HighVariable for this formal parameter from the callee's HighFunction.
-                                    hv_to_taint_in_callee = target_formal_param.getHighVariable(high_called_func)
+                                    # target_formal_param is a ParameterDB object in this Ghidra version.
+                                    # We need to find the corresponding HighSymbol in the high_called_func's local symbol map.
+                                    found_matching_high_symbol = False
+                                    local_symbols_iter = high_called_func.getLocalSymbolMap().getSymbols()
+                                    while local_symbols_iter.hasNext():
+                                        high_symbol = local_symbols_iter.next()
+                                        if high_symbol.isParameter():
+                                            # Compare storage to link ParameterDB to HighSymbol
+                                            if high_symbol.getStorage().equals(target_formal_param.getVariableStorage()):
+                                                hv_to_taint_in_callee = high_symbol.getHighVariable()
+                                                found_matching_high_symbol = True
+                                                break 
+                                    if not found_matching_high_symbol:
+                                        # Fallback: attempt to match by name if storage did not yield a result (less reliable)
+                                        # Or if parameter storage is dynamic/complex and direct equals fails.
+                                        local_symbols_iter_name_fallback = high_called_func.getLocalSymbolMap().getSymbols()
+                                        while local_symbols_iter_name_fallback.hasNext():
+                                            high_symbol_fb = local_symbols_iter_name_fallback.next()
+                                            if high_symbol_fb.isParameter() and high_symbol_fb.getName() == target_formal_param.getName():
+                                                hv_to_taint_in_callee = high_symbol_fb.getHighVariable()
+                                                printerr_func("WARN: Matched param '{}' in {} to HighSymbol by NAME after storage match failed. This might be less reliable.".format(
+                                                    target_formal_param.getName(), high_called_func.getFunction().getName()))
+                                                found_matching_high_symbol = True # Set true here as well
+                                                break
+                                    
+                                    if not found_matching_high_symbol:
+                                         printerr_func("ERROR: [{} @ {}] Could not find matching HighSymbol for formal param '{}' (type: {}) in {} by storage or name.".format(
+                                            func_name, current_op_address_str, target_formal_param.getName(),
+                                            type(target_formal_param).__name__,
+                                            high_called_func.getFunction().getName()))
+
                                 except Exception as e_hv:
-                                    printerr_func("ERROR: [{} @ {}] Exception getting HighVariable for formal param '{}' in {}: {}".format(
+                                    printerr_func("ERROR: [{} @ {}] Exception looking up HighSymbol for formal param '{}' (type: {}) in {}: {}".format(
                                         func_name, current_op_address_str, target_formal_param.getName(),
+                                        type(target_formal_param).__name__,
                                         high_called_func.getFunction().getName(), e_hv))
 
                                 if hv_to_taint_in_callee:
@@ -554,7 +584,7 @@ def trace_taint_in_function(
                                         get_varnode_representation(hv_to_taint_in_callee, high_called_func, current_program)
                                     ))
                                 else:
-                                    println_func("WARN: [{} @ {}] Tainted PCode argument #{} for {} to {}. Could not retrieve HighVariable for callee's formal parameter #{} (name: '{}').".format(
+                                    println_func("WARN: [{} @ {}] Tainted PCode argument #{} for {} to {}. Could not retrieve HighVariable for callee's formal param #{} (name: '{}').".format(
                                         func_name, current_op_address_str, pcode_arg_idx - 1,
                                         mnemonic, called_function_obj.getName(),
                                         conceptual_arg_index, target_formal_param.getName()
@@ -689,10 +719,37 @@ def trace_taint_in_function(
                                         target_formal_param_attempt = ordered_callee_formal_params_attempt[conceptual_arg_index_attempt]
                                         hv_to_taint_in_callee_attempt = None
                                         try:
-                                            hv_to_taint_in_callee_attempt = target_formal_param_attempt.getHighVariable(high_attempted_func)
+                                            # Similar logic for the exploration path
+                                            found_matching_high_symbol_attempt = False
+                                            local_symbols_iter_attempt = high_attempted_func.getLocalSymbolMap().getSymbols()
+                                            while local_symbols_iter_attempt.hasNext():
+                                                high_symbol_att = local_symbols_iter_attempt.next()
+                                                if high_symbol_att.isParameter():
+                                                    if high_symbol_att.getStorage().equals(target_formal_param_attempt.getVariableStorage()):
+                                                        hv_to_taint_in_callee_attempt = high_symbol_att.getHighVariable()
+                                                        found_matching_high_symbol_attempt = True
+                                                        break
+                                            if not found_matching_high_symbol_attempt:
+                                                local_symbols_iter_name_fallback_attempt = high_attempted_func.getLocalSymbolMap().getSymbols()
+                                                while local_symbols_iter_name_fallback_attempt.hasNext():
+                                                    high_symbol_fb_att = local_symbols_iter_name_fallback_attempt.next()
+                                                    if high_symbol_fb_att.isParameter() and high_symbol_fb_att.getName() == target_formal_param_attempt.getName():
+                                                        hv_to_taint_in_callee_attempt = high_symbol_fb_att.getHighVariable()
+                                                        printerr_func("WARN: (Exploration Path) Matched param '{}' in {} to HighSymbol by NAME after storage match failed.".format(
+                                                            target_formal_param_attempt.getName(), high_attempted_func.getFunction().getName()))
+                                                        found_matching_high_symbol_attempt = True # Set true here
+                                                        break
+
+                                            if not found_matching_high_symbol_attempt:
+                                                printerr_func("ERROR: [{} @ {}] (Exploration Path) Could not find matching HighSymbol for formal param '{}' (type: {}) in {} by storage or name.".format(
+                                                    func_name, current_op_address_str, target_formal_param_attempt.getName(),
+                                                    type(target_formal_param_attempt).__name__,
+                                                    high_attempted_func.getFunction().getName()))
+
                                         except Exception as e_hv_att:
-                                            printerr_func("ERROR: [{} @ {}] Exception getting HighVariable for formal param '{}' in explored {}: {}".format(
+                                            printerr_func("ERROR: [{} @ {}] Exception looking up HighSymbol for formal param '{}' (type: {}) in explored {}: {}".format(
                                                 func_name, current_op_address_str, target_formal_param_attempt.getName(),
+                                                type(target_formal_param_attempt).__name__,
                                                 high_attempted_func.getFunction().getName(), e_hv_att))
 
                                         if hv_to_taint_in_callee_attempt:
@@ -872,17 +929,23 @@ def log_unresolved_call_with_tainted_args(pcode_op, current_high_func, prog, tai
 println("DEBUG: Interprocedural Value Taint Tracking Script Starting...")
 
 decompiler = None
-# Ensure Ghidra globals are available (moved outside try-finally for decompiler for clarity)
+# Ensure Ghidra globals are available
 try:
     # These are Ghidra's built-in functions/globals when run in Script Manager
     if 'currentProgram' not in globals() or currentProgram is None:
         try:
-            from __main__ import currentProgram, askAddress, println, printerr, monitor, askString
+            from __main__ import currentProgram, askAddress, println, printerr, monitor, askString, getFunctionManager
         except ImportError:
              print("Error: Essential Ghidra variables (currentProgram, etc.) not defined. Please run from Ghidra Script Manager.")
              raise SystemExit() # Exit if essential Ghidra context is missing
+    # If getFunctionManager is not imported above, try to get it if Ghidra version requires
+    if 'getFunctionManager' not in globals():
+        try:
+            from __main__ import getFunctionManager
+        except ImportError:
+            pass # It might be available via currentProgram.getFunctionManager() later
 
-except NameError: # Fallback for environments where these might not be pre-defined as globals and __main__ trick is needed
+except NameError: # Fallback
     try:
         from __main__ import currentProgram, askAddress, println, printerr, monitor, askString, getFunctionManager
         if currentProgram is None: raise ImportError("currentProgram is None after import")
@@ -895,127 +958,253 @@ try:
     all_tainted_usages = []
     visited_function_states = set()
 
-    parent_func_addr_input = askAddress("Initial Function Start", "Enter address of the function where analysis begins:")
-    call_site_addr_input = askAddress("Initial Call Site (Optional)", 
-                                      "Enter address of a CALL instruction. The script will attempt to taint the variable associated with its last P-code input (often the output or a modified reference). Leave blank if tainting a parameter/other local directly by name.")
+    # Initialize decompiler and function manager
+    decompiler = DecompInterface()
+    options = DecompileOptions()
+    # Configure options as needed
+    decompiler.setOptions(options)
+    if not decompiler.openProgram(currentProgram):
+        printerr("Failed to open program with decompiler. Script terminated.")
+        decompiler = None
+        raise SystemExit()
 
-    if parent_func_addr_input is None:
-        printerr("User cancelled or provided invalid initial function address. Script terminated.")
-        # Consider raising SystemExit here if appropriate in Ghidra scripting
-    else:
-        output_slot_local_var_name_hint = None # Initialize to None
-
-        if call_site_addr_input:
-            # Call site is provided. We will try to auto-detect the taint source.
-            # output_slot_local_var_name_hint remains None for auto-detection.
-            println("DEBUG: Call site {} provided. Will attempt to auto-detect taint source from its last P-code input/output slot.".format(call_site_addr_input))
-        else:
-            # No call site provided, so we MUST ask for a variable name hint.
-            output_slot_local_var_name_hint_str = askString("Tainted Variable Name Hint", 
-                                                        "Enter name of the variable (e.g., local_68, or a parameter name) that is initially tainted.")
-            if output_slot_local_var_name_hint_str: # User provided a name
-                output_slot_local_var_name_hint = output_slot_local_var_name_hint_str.strip()
-                if not output_slot_local_var_name_hint: # If it was just whitespace
-                     output_slot_local_var_name_hint = None # Treat as not provided
-            # If user provided nothing or cancelled, output_slot_local_var_name_hint remains None
-
+    # Get func_manager
+    try:
         func_manager = currentProgram.getFunctionManager()
-
-        decompiler = DecompInterface()
-        options = DecompileOptions()
-        # Configure options as needed, e.g., for better analysis or specific processor
-        # options.setรอบDeclaredData(True) # Example option
-        decompiler.setOptions(options)
-
-        if not decompiler.openProgram(currentProgram):
-            printerr("Failed to open program with decompiler. Script terminated.")
-            decompiler = None # Ensure it's None if failed
+    except AttributeError: # Fallback for older Ghidra versions or different API access
+        if 'getFunctionManager' in globals() and getFunctionManager is not None:
+            func_manager = getFunctionManager()
+        else:
+            printerr("FATAL: Could not get FunctionManager. Script cannot proceed.")
             raise SystemExit()
 
-        initial_function_obj = func_manager.getFunctionContaining(parent_func_addr_input)
-        if initial_function_obj is None or not initial_function_obj.getEntryPoint().equals(parent_func_addr_input):
-            initial_function_obj = func_manager.getFunctionAt(parent_func_addr_input)
+    analysis_performed_via_new_method = False
+    target_callee_func_name_input = askString("Target Callee Function Name (Optional)",
+                                             "Enter name of a function (e.g., ANC_detect). Script will analyze its callers. Leave blank for original input methods.")
 
-        if initial_function_obj is None:
-            printerr("Initial function not found at address: {}.".format(parent_func_addr_input))
+    if target_callee_func_name_input and target_callee_func_name_input.strip():
+        target_callee_func_name = target_callee_func_name_input.strip()
+        println("DEBUG: User provided target callee function name: '{}'".format(target_callee_func_name))
+
+        # target_functions = currentProgram.getGlobalFunctions(target_callee_func_name) # Original problematic line
+        # New approach:
+        all_functions_iter = func_manager.getFunctions(True) # Get an iterator for all functions (True for external)
+        target_functions_list = []
+        while all_functions_iter.hasNext():
+            f = all_functions_iter.next()
+            if f.getName() == target_callee_func_name:
+                target_functions_list.append(f)
+        target_functions = target_functions_list
+
+        if not target_functions:
+            printerr("ERROR: Function '{}' not found in the program.".format(target_callee_func_name))
         else:
-            println("DEBUG: Initial Function to analyze: {} at {}".format(initial_function_obj.getName(), initial_function_obj.getEntryPoint()))
-            
-            decompile_results_initial = decompiler.decompileFunction(initial_function_obj, 60, monitor)
-            if not decompile_results_initial or decompile_results_initial.getHighFunction() is None:
-                printerr("Failed to decompile initial function: {}. Script terminated.".format(initial_function_obj.getName()))
-            else:
-                high_initial_function = decompile_results_initial.getHighFunction()
-                initial_taint_source_hv_set = set()
-                start_pcode_op_for_trace = None 
+            if len(target_functions) > 1:
+                println("WARN: Multiple functions found for name '{}'. Using the first one: {} at {}".format(
+                    target_callee_func_name, target_functions[0].getName(), target_functions[0].getEntryPoint()))
+            target_function_obj = target_functions[0]
+            println("DEBUG: Found target function {} at {}".format(target_function_obj.getName(), target_function_obj.getEntryPoint()))
 
-                if call_site_addr_input:
-                    # output_slot_local_var_name_hint is None, find_highlocal_for_output_slot will try to work without a name.
-                    println("DEBUG: Initial taint source is related to call at {} (attempting auto-detection from last P-code input/output slot).".format(call_site_addr_input))
-                    V_addr_of_output_ptr_var, call_site_pcode_op_initial = get_initial_taint_source(
-                        high_initial_function, call_site_addr_input, printerr, println
+            references = currentProgram.getReferenceManager().getReferencesTo(target_function_obj.getEntryPoint())
+            call_site_addresses = []
+            for ref in references:
+                if ref.getReferenceType().isCall():
+                    caller_func_check = func_manager.getFunctionContaining(ref.getFromAddress())
+                    if caller_func_check:
+                        call_site_addresses.append(ref.getFromAddress())
+                    else:
+                        println("DEBUG: Ignoring reference to {} from {} as it's not within a defined function's body.".format(
+                            target_callee_func_name, ref.getFromAddress()))
+            
+            if not call_site_addresses:
+                println("INFO: No direct call sites found for function '{}' originating from within other defined functions.".format(target_callee_func_name))
+            else:
+                println("INFO: Found {} call site(s) for function '{}'. Analyzing each:".format(len(call_site_addresses), target_callee_func_name))
+                analysis_performed_via_new_method = True
+
+                for i, call_site_addr in enumerate(call_site_addresses):
+                    println("\\n--- Analyzing Call Site #{} to {} (Call is at {}) ---".format(i + 1, target_callee_func_name, call_site_addr))
+                    
+                    parent_of_call_site_func = func_manager.getFunctionContaining(call_site_addr)
+                    if not parent_of_call_site_func: # Should have been filtered, but double check
+                        printerr("ERROR: Could not find parent function for call site at {}. Skipping this call site.".format(call_site_addr))
+                        continue
+
+                    println("DEBUG: Parent (caller) function of this call site: {} at {}".format(parent_of_call_site_func.getName(), parent_of_call_site_func.getEntryPoint()))
+
+                    decompile_results_parent = decompiler.decompileFunction(parent_of_call_site_func, 60, monitor)
+                    if not decompile_results_parent or decompile_results_parent.getHighFunction() is None:
+                        printerr("Failed to decompile parent function: {}. Skipping this call site.".format(parent_of_call_site_func.getName()))
+                        continue
+                    
+                    high_parent_function = decompile_results_parent.getHighFunction()
+                    current_initial_taint_source_hv_set = set()
+                    current_start_pcode_op_for_trace = None
+
+                    V_addr_of_output_ptr_var, call_site_pcode_op = get_initial_taint_source(
+                        high_parent_function, call_site_addr, printerr, println
                     )
-                    if V_addr_of_output_ptr_var and call_site_pcode_op_initial:
-                        # Pass the None hint to find_highlocal_for_output_slot
-                        H_output_var = find_highlocal_for_output_slot(high_initial_function, V_addr_of_output_ptr_var, output_slot_local_var_name_hint, println, currentProgram)
+
+                    if V_addr_of_output_ptr_var and call_site_pcode_op:
+                        H_output_var = find_highlocal_for_output_slot(high_parent_function, V_addr_of_output_ptr_var, None, println, currentProgram) # Hint is None
                         if H_output_var:
-                            initial_taint_source_hv_set.add(H_output_var)
-                            start_pcode_op_for_trace = call_site_pcode_op_initial 
-                            println("DEBUG: Initial taint source (from call site, auto-detected): {}. Analysis will start after PCodeOp {} @ {}.".format(
-                                get_varnode_representation(H_output_var, high_initial_function, currentProgram),
-                                start_pcode_op_for_trace, start_pcode_op_for_trace.getSeqnum().getTarget()
-                                ))
+                            current_initial_taint_source_hv_set.add(H_output_var)
+                            current_start_pcode_op_for_trace = call_site_pcode_op
+                            println("DEBUG: Initial taint source for this call site (auto-detected from call output): {}. Analysis in {} will start after PCodeOp {} @ {}.".format(
+                                get_varnode_representation(H_output_var, high_parent_function, currentProgram),
+                                parent_of_call_site_func.getName(),
+                                current_start_pcode_op_for_trace, current_start_pcode_op_for_trace.getSeqnum().getTarget()
+                            ))
                         else:
                             printerr("ERROR: Could not automatically determine HighLocal from call site {} (V_ref was {}). Cannot set initial taint.".format(
-                                call_site_addr_input,
-                                get_varnode_representation(V_addr_of_output_ptr_var, high_initial_function, currentProgram) if V_addr_of_output_ptr_var else "None"
+                                call_site_addr,
+                                get_varnode_representation(V_addr_of_output_ptr_var, high_parent_function, currentProgram) if V_addr_of_output_ptr_var else "None"
                             ))
                     else:
-                        printerr("ERROR: Could not identify reference parameter or PCodeOp for call site {}. Cannot set initial taint.".format(call_site_addr_input))
-                
-                elif output_slot_local_var_name_hint: # No call site, but a name hint was provided
-                    println("DEBUG: Initial taint source is named variable/parameter '{}' in {}.".format(output_slot_local_var_name_hint, initial_function_obj.getName()))
-                    found_var_hv = None
-                    lsm = high_initial_function.getLocalSymbolMap()
-                    if lsm: 
-                        symbols_iter = lsm.getSymbols()
-                        while symbols_iter.hasNext():
-                            symbol = symbols_iter.next()
-                            if symbol and symbol.getName() == output_slot_local_var_name_hint:
-                                hv = symbol.getHighVariable()
-                                if hv: # Could be HighLocal or HighParam
-                                    found_var_hv = hv
-                                    break
-                    if found_var_hv:
-                        initial_taint_source_hv_set.add(found_var_hv)
-                        # start_pcode_op_for_trace remains None, so analysis starts from function beginning
-                        println("DEBUG: Initial taint source (direct variable): {}. Analysis will start from beginning of function.".format(
-                            get_varnode_representation(found_var_hv, high_initial_function, currentProgram)))
-                    else:
-                        printerr("ERROR: Could not find variable/parameter named '{}' in function {} to set as initial taint source.".format(output_slot_local_var_name_hint, initial_function_obj.getName()))
-                else: # Neither call site, nor a name hint if call site wasn't given
-                    printerr("ERROR: No valid initial taint source specified. Please provide a call site for auto-detection or a direct variable name. Analysis cannot start.")
+                        printerr("ERROR: Could not identify reference parameter or PCodeOp for call site {} in function {}. Cannot set initial taint.".format(
+                            call_site_addr, parent_of_call_site_func.getName()))
+                        continue 
 
-                if initial_taint_source_hv_set:
-                    println("\n--- Initiating Taint Analysis ---")
+                    if current_initial_taint_source_hv_set:
+                        println("\\n--- Initiating Taint Analysis for: {} calling {} (call at {}) ---".format(parent_of_call_site_func.getName(), target_callee_func_name, call_site_addr))
+                        trace_taint_in_function(
+                            high_parent_function,
+                            current_initial_taint_source_hv_set,
+                            current_start_pcode_op_for_trace,
+                            currentProgram,
+                            decompiler, println, printerr, monitor,
+                            current_depth=0,
+                            func_manager_ref=func_manager
+                        )
+                    else:
+                        println("No initial taint source could be established for call site at {} in {}. Analysis not started for this site.".format(call_site_addr, parent_of_call_site_func.getName()))
+                # End of loop over call sites
+    
+    # Fallback to original input methods if the new method was not used or did not perform any analysis
+    if not analysis_performed_via_new_method:
+        println("DEBUG: New method (by target callee name) did not run or found no call sites to analyze. Falling back to original input method.")
+        
+        initial_function_obj = None 
+        output_slot_local_var_name_hint = None
+        # This variable name is call_site_addr_input in original script. Renaming to avoid conflict if needed.
+        call_site_addr_input_orig = askAddress("Initial Call Site (Primary Input)", 
+                                          "Enter address of a CALL instruction. Analysis will start in its parent function, using this call's output as taint source. Leave blank for manual function/variable input.")
+
+        if call_site_addr_input_orig:
+            println("DEBUG: Call site {} provided (original method). Attempting to auto-detect parent function and taint source.".format(call_site_addr_input_orig))
+            temp_initial_func = func_manager.getFunctionContaining(call_site_addr_input_orig)
+            if temp_initial_func:
+                initial_function_obj = temp_initial_func
+                # parent_func_addr_input = initial_function_obj.getEntryPoint() # Original script line
+                println("DEBUG: Auto-detected parent function: {} at {}".format(initial_function_obj.getName(), initial_function_obj.getEntryPoint()))
+                # output_slot_local_var_name_hint remains None for this path
+            else:
+                printerr("ERROR: Could not find function containing call site address: {}. Please provide function and variable name manually.".format(call_site_addr_input_orig))
+                call_site_addr_input_orig = None # Nullify to trigger manual input path below
+        
+        if not call_site_addr_input_orig: 
+            if initial_function_obj is None : 
+                println("DEBUG: No valid call site provided for auto-detection, or parent function detection failed. Asking for manual function and variable name input.")
+            
+            manual_parent_func_addr_str = askAddress("Initial Function Start (Manual)", "Enter address of the function where analysis begins:")
+            if manual_parent_func_addr_str:
+                # parent_func_addr_input = manual_parent_func_addr_str # Original script line
+                temp_initial_func = func_manager.getFunctionContaining(manual_parent_func_addr_str)
+                if temp_initial_func is None or not temp_initial_func.getEntryPoint().equals(manual_parent_func_addr_str):
+                    initial_function_obj = func_manager.getFunctionAt(manual_parent_func_addr_str)
+                else:
+                    initial_function_obj = temp_initial_func
+
+                if initial_function_obj:
+                    println("DEBUG: Manual initial function selected: {} at {}".format(initial_function_obj.getName(), initial_function_obj.getEntryPoint()))
+                    output_slot_local_var_name_hint_str = askString("Tainted Variable Name Hint (Manual)", 
+                                                                    "Enter name of the variable (e.g., local_68, or a parameter) in {} that is initially tainted.".format(initial_function_obj.getName()))
+                    if output_slot_local_var_name_hint_str:
+                        output_slot_local_var_name_hint = output_slot_local_var_name_hint_str.strip()
+                        if not output_slot_local_var_name_hint: 
+                            output_slot_local_var_name_hint = None 
+                else:
+                    printerr("ERROR: Function not found at manually entered address: {}. Cannot proceed.".format(manual_parent_func_addr_str))
+            else: 
+                printerr("User cancelled manual input for initial function address.")
+
+        # Proceed with analysis if initial_function_obj was set by the original methods
+        if initial_function_obj:
+            println("DEBUG: Initial Function to analyze (original method): {} at {}".format(initial_function_obj.getName(), initial_function_obj.getEntryPoint()))
+            decompile_results_initial = decompiler.decompileFunction(initial_function_obj, 60, monitor)
+            if not decompile_results_initial or decompile_results_initial.getHighFunction() is None:
+                printerr("Failed to decompile initial function: {}. Analysis via original method cannot continue.".format(initial_function_obj.getName()))
+            else:
+                high_initial_function = decompile_results_initial.getHighFunction()
+                initial_taint_source_hv_set_orig = set()
+                start_pcode_op_for_trace_orig = None 
+
+                if call_site_addr_input_orig: # Taint from call site output
+                    println("DEBUG: Initial taint source for original method is related to call at {}.".format(call_site_addr_input_orig))
+                    V_addr_of_output_ptr_var_orig, call_site_pcode_op_initial_orig = get_initial_taint_source(
+                        high_initial_function, call_site_addr_input_orig, printerr, println
+                    )
+                    if V_addr_of_output_ptr_var_orig and call_site_pcode_op_initial_orig:
+                        H_output_var_orig = find_highlocal_for_output_slot(high_initial_function, V_addr_of_output_ptr_var_orig, None, println, currentProgram) # hint is None
+                        if H_output_var_orig:
+                            initial_taint_source_hv_set_orig.add(H_output_var_orig)
+                            start_pcode_op_for_trace_orig = call_site_pcode_op_initial_orig 
+                            println("DEBUG: Initial taint source (from call site, original method): {}. Analysis will start after PCodeOp {} @ {}.".format(
+                                get_varnode_representation(H_output_var_orig, high_initial_function, currentProgram),
+                                start_pcode_op_for_trace_orig, start_pcode_op_for_trace_orig.getSeqnum().getTarget()
+                                ))
+                        else:
+                            printerr("ERROR: Could not automatically determine HighLocal from call site {} (original method).".format(call_site_addr_input_orig))
+                    else:
+                        printerr("ERROR: Could not identify reference parameter or PCodeOp for call site {} (original method).".format(call_site_addr_input_orig))
+                
+                elif output_slot_local_var_name_hint: # Taint from named variable
+                    println("DEBUG: Initial taint source for original method is named variable/parameter '{}' in {}.".format(output_slot_local_var_name_hint, initial_function_obj.getName()))
+                    found_var_hv_orig = None
+                    lsm_orig = high_initial_function.getLocalSymbolMap()
+                    if lsm_orig: 
+                        symbols_iter_orig = lsm_orig.getSymbols()
+                        while symbols_iter_orig.hasNext():
+                            symbol_orig = symbols_iter_orig.next()
+                            if symbol_orig and symbol_orig.getName() == output_slot_local_var_name_hint:
+                                hv_orig = symbol_orig.getHighVariable()
+                                if hv_orig: 
+                                    found_var_hv_orig = hv_orig
+                                    break
+                    if found_var_hv_orig:
+                        initial_taint_source_hv_set_orig.add(found_var_hv_orig)
+                        println("DEBUG: Initial taint source (direct variable, original method): {}. Analysis will start from beginning of function.".format(
+                            get_varnode_representation(found_var_hv_orig, high_initial_function, currentProgram)))
+                    else:
+                        printerr("ERROR: Could not find variable/parameter named '{}' in function {} (original method).".format(output_slot_local_var_name_hint, initial_function_obj.getName()))
+                else: 
+                    printerr("ERROR: No valid initial taint source specified for original method. Analysis cannot start.")
+
+                if initial_taint_source_hv_set_orig:
+                    println("\\n--- Initiating Taint Analysis (original method) ---")
                     trace_taint_in_function(
                         high_initial_function,
-                        initial_taint_source_hv_set,
-                        start_pcode_op_for_trace, # Can be None
+                        initial_taint_source_hv_set_orig,
+                        start_pcode_op_for_trace_orig, 
                         currentProgram,
                         decompiler, 
-                        println, printerr, monitor, # Pass monitor here
+                        println, printerr, monitor,
                         current_depth=0,
                         func_manager_ref=func_manager
                     )
-                    
-                    println("\n--- Taint Analysis Complete ---")
-                    if all_tainted_usages:
-                        print_tainted_value_usage_results(all_tainted_usages, println, is_global_print=True)
-                    else:
-                        println("No tainted value usages detected across the analyzed functions.")
                 else:
-                    println("No initial taint source could be established. Analysis not started.")
+                    println("No initial taint source could be established for original method. Analysis not started.")
+        elif not analysis_performed_via_new_method : # If new method also didn't run, and old method didn't set an initial_function_obj
+             printerr("CRITICAL ERROR: No initial function could be determined by any method. Script cannot start analysis.")
+
+
+    # --- Print final results ---
+    # This part is outside the 'if not analysis_performed_via_new_method' block, so it prints combined results
+    println("\n--- Taint Analysis Run Complete ---")
+    if all_tainted_usages:
+        print_tainted_value_usage_results(all_tainted_usages, println, is_global_print=True)
+    else:
+        println("No tainted value usages detected across all analyzed functions/call sites.")
 
 except Exception as e:
     import traceback
@@ -1051,7 +1240,7 @@ except Exception as e:
         _effective_printerr("Error trying to print traceback: {}".format(str(te_print)))
 
 finally:
-    if 'decompiler' in locals() and decompiler is not None:
+    if 'decompiler' in locals() and decompiler is not None: # Removed isProgramOpen() check
         decompiler.dispose()
         # Check for println availability before using it in finally block
         if 'println' in globals(): 
