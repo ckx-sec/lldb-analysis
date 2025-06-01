@@ -120,32 +120,58 @@ def print_tainted_value_usage_results(results_list, println_func, is_global_prin
     else:
         println_func("\n--- Detected Tainted Value Usages (Current Function Scope) ---")
 
-    # Define the usage types to be included in the final print
-    # We want to include anything related to BRANCH, CALL, or RETURN_TAINTED_VALUE
-    # and exclude STORE_TAINTED_VALUE.
-    # More explicit check:
     included_usage_types = [
         "BRANCH_CONDITION_TAINTED",
         "TAINTED_ARG_TO_CALL_RECURSION",
         "TAINTED_ARG_TO_CALL_NO_PARAM_MAP_OR_VARARGS",
         "TAINTED_ARG_TO_EXPLORED_CALL_NO_PARAM_MAP",
         "TAINTED_ARG_TO_UNRESOLVED_CALL",
-        "EXPLORING_INITIALLY_UNRESOLVED_CALL", # This implies a call
+        "EXPLORING_INITIALLY_UNRESOLVED_CALL", 
         "RETURN_TAINTED_VALUE"
-        # Other types like TAINT_REACHED_INPUT_PARAMETER_TERMINATION are implicitly excluded 
-        # unless they also happen to contain BRANCH or CALL in their string, which is unlikely based on current types.
-        # If TAINT_REACHED_INPUT_PARAMETER_TERMINATION (which can happen via STORE or direct propagation) 
-        # should also be filtered, its exclusion should be handled where it's added or this filter needs to be more specific.
     ]
 
     filtered_results_to_print = []
+    # Core names of CPU flags to ignore if they are the tainted component in a branch condition
+    # These should be lowercase for case-insensitive comparison.
+    cpu_flag_core_names = [
+        "tmpcy", "ng", "zf", "cf", "of", "sf", "pf", 
+        "tmpnz", "tmpov", "tmpca", "af", 
+        "cc_n", "cc_z", "cc_c", "cc_v" # ARM condition codes
+    ]
+
     for res in results_list:
+        include_this_result = False
         if res["usage_type"] in included_usage_types:
+            include_this_result = True # Tentatively include based on usage type
+
+            if res["usage_type"] == "BRANCH_CONDITION_TAINTED":
+                is_cpu_flag_component = False
+                tainted_comp_repr = res.get("tainted_component_repr", "")
+                lc_tainted_comp_repr = tainted_comp_repr.lower()
+
+                for flag_name in cpu_flag_core_names:
+                    # Check for forms like "name(flagname)" or "(flagname)"
+                    # e.g., "unnamed(tmpcy)" or "other(ng)"
+                    if "({}".format(flag_name) in lc_tainted_comp_repr and lc_tainted_comp_repr.endswith(")"):
+                        last_paren_open_idx = lc_tainted_comp_repr.rfind('(')
+                        # Ensure there is a ')' at the end and '(' is before it.
+                        if last_paren_open_idx != -1 and lc_tainted_comp_repr[-1] == ')':
+                            content_in_paren = lc_tainted_comp_repr[last_paren_open_idx+1:-1]
+                            if content_in_paren == flag_name:
+                                is_cpu_flag_component = True
+                                break
+                    # Check for form where the flag name is the whole representation (direct register)
+                    # e.g., "ng" or "tmpcy"
+                    if lc_tainted_comp_repr == flag_name:
+                        is_cpu_flag_component = True
+                        break
+                
+                if is_cpu_flag_component:
+                    println_func("DEBUG: Filtering out BRANCH_CONDITION_TAINTED for CPU flag: {} (Original: {})".format(lc_tainted_comp_repr, tainted_comp_repr))
+                    include_this_result = False # Exclude this result
+        
+        if include_this_result:
             filtered_results_to_print.append(res)
-        # For TAINT_REACHED_INPUT_PARAMETER_TERMINATION, it is a termination, 
-        # but not directly a branch/call/return of the original tainted value in the same way.
-        # If it needs to be included or excluded specifically, the condition needs adjustment.
-        # Currently, it will be excluded if not in the explicit list.
 
     if not filtered_results_to_print and is_global_print:
         println_func("No usages matching the current filter (BRANCH, CALL, RETURN_TAINTED_VALUE related) were found.")
@@ -398,6 +424,30 @@ def trace_taint_in_function(
         output_hv = output_vn.getHigh() if output_vn else None
         mnemonic = current_pcode_op.getMnemonic()
 
+        # Attempt to resolve called_function_obj if current_pcode_op is a CALL/CALLIND
+        # This will be used for both strlen check and general call recursion logic later
+        called_function_obj_for_current_op = None
+        if mnemonic in ["CALL", "CALLIND"]:
+            target_vn = current_pcode_op.getInput(0)
+            if mnemonic == "CALL" and target_vn.isConstant():
+                try:
+                    addr = current_program.getAddressFactory().getAddress(hex(target_vn.getOffset()))
+                    if addr and func_manager_ref:
+                        called_function_obj_for_current_op = func_manager_ref.getFunctionAt(addr)
+                except: pass
+            elif func_manager_ref: # For CALLIND or non-const CALL target
+                ref_iter = current_program.getReferenceManager().getReferencesFrom(current_op_address, 0)
+                for ref in ref_iter:
+                    if ref.getReferenceType().isCall():
+                        ref_target_addr = ref.getToAddress()
+                        func_from_ref = func_manager_ref.getFunctionAt(ref_target_addr)
+                        if func_from_ref:
+                            called_function_obj_for_current_op = func_from_ref
+                            # Basic resolution print (can be removed if too verbose)
+                            # println_func("DEBUG: [{} @ {}] Resolved {} to {} via ref manager (for current op eval).".format(
+                            #    func_name, current_op_address_str, mnemonic, called_function_obj_for_current_op.getName()))
+                            break 
+
         # --- TAINT USAGE & TERMINATION CHECKS (now some are non-terminating logs) ---
         if mnemonic == "CBRANCH":
             condition_vn = current_pcode_op.getInput(1)
@@ -429,17 +479,32 @@ def trace_taint_in_function(
                         def_op_cond.getMnemonic(), compared_ops_repr[0], compared_ops_repr[1]
                     )
                 
-                all_tainted_usages.append({
-                    "function_name": func_name, "function_entry": func_entry_addr.toString(),
-                    "address": current_op_address.toString(), "pcode_op_str": str(current_pcode_op),
-                    "usage_type": "BRANCH_CONDITION_TAINTED", # Changed from BRANCH_CONDITION_TERMINATION
-                    "tainted_component_repr": condition_hv_repr, # Use the representation obtained
-                    "compared_operands": compared_ops_repr,
-                    "details": details_cbranch
-                })
-                println_func("INFO: [{} @ {}] Taint reached CBRANCH condition. Operands: {}. Analysis will continue.".format( # Message changed
-                    func_name, current_op_address_str, compared_ops_repr
-                ))
+                # Check original assembly instruction for CBZ/CBNZ before reporting
+                skip_this_cbranch_report_due_to_assembly = False
+                instruction_at_op = currentProgram.getListing().getInstructionAt(current_op_address)
+                if instruction_at_op:
+                    assembly_mnemonic = instruction_at_op.getMnemonicString().lower()
+                    # Check for cbz, cbnz, and potentially their size-suffixed variants (e.g. cbz.w, cbnz.x)
+                    # For now, let's stick to the exact "cbz" and "cbnz" as per user example,
+                    # but this could be expanded with startswith if needed.
+                    if assembly_mnemonic == "cbz" or assembly_mnemonic == "cbnz":
+                        println_func("DEBUG: [CBZ/CBNZ Assembly Filter] Skipping BRANCH_CONDITION_TAINTED report for {} at {} because original assembly is '{}'.".format(
+                            func_name, current_op_address_str, instruction_at_op.getMnemonicString()
+                        ))
+                        skip_this_cbranch_report_due_to_assembly = True
+                
+                if not skip_this_cbranch_report_due_to_assembly:
+                    all_tainted_usages.append({
+                        "function_name": func_name, "function_entry": func_entry_addr.toString(),
+                        "address": current_op_address.toString(), "pcode_op_str": str(current_pcode_op),
+                        "usage_type": "BRANCH_CONDITION_TAINTED", 
+                        "tainted_component_repr": condition_hv_repr, 
+                        "compared_operands": compared_ops_repr,
+                        "details": details_cbranch
+                    })
+                    println_func("INFO: [{} @ {}] Taint reached CBRANCH condition. Operands: {}. Analysis will continue.".format( 
+                        func_name, current_op_address_str, compared_ops_repr
+                    ))
                 # return # Removed to allow analysis to continue
 
         # --- Store, Return (Non-terminating, just for logging interest) --- 
@@ -509,49 +574,83 @@ def trace_taint_in_function(
         
         # --- RECURSIVE CALL HANDLING --- 
         if mnemonic in ["CALL", "CALLIND"]:
+            # --- BEGIN SPECIAL MEMCPY HANDLING ---
+            memcpy_special_handling_applied = False
+            # Resolve called_function_obj once for this CALL/CALLIND op
             called_function_obj = None
-            target_func_addr_vn = current_pcode_op.getInput(0) # This is the PCode varnode for the call target
+            target_func_addr_vn = current_pcode_op.getInput(0) 
 
-            # Step 1: Direct CALL to a constant address via P-code
             if mnemonic == "CALL" and target_func_addr_vn.isConstant():
                 try:
                     called_func_address = current_program.getAddressFactory().getAddress(hex(target_func_addr_vn.getOffset()))
-                    if called_func_address:
+                    if called_func_address and func_manager_ref:
                         called_function_obj = func_manager_ref.getFunctionAt(called_func_address)
-                        if called_function_obj:
-                            println_func("DEBUG: [{} @ {}] Resolved CALL to constant PCode target {} -> function {}.".format(
-                                func_name, current_op_address_str, called_func_address, called_function_obj.getName()))
-                except Exception as e:
-                    printerr_func("ERROR: [{} @ {}] Converting PCode constant target {} for CALL: {}".format(
-                        func_name, current_op_address_str, target_func_addr_vn.getOffset(), e))
-
-            # Step 2: For CALLIND, or CALL to non-constant P-code target (if not resolved above), try Ghidra's reference manager
-            # This is often effective for well-analyzed indirect calls or PLT-like structures.
-            if called_function_obj is None:
-                # Only proceed if it's CALLIND, or if it's CALL and its PCode target wasn't a resolvable constant above.
-                should_try_ref_man = False
-                if mnemonic == "CALLIND":
-                    should_try_ref_man = True
-                    println_func("DEBUG: [{} @ {}] CALLIND target {}. Attempting resolution via reference manager.".format(
-                        func_name, current_op_address_str, get_varnode_representation(target_func_addr_vn, high_func_to_analyze, current_program)))
-                elif mnemonic == "CALL" and not target_func_addr_vn.isConstant(): # CALL to reg, ram, etc.
-                    should_try_ref_man = True
-                    println_func("DEBUG: [{} @ {}] CALL to non-constant PCode target {}. Attempting resolution via reference manager.".format(
-                        func_name, current_op_address_str, get_varnode_representation(target_func_addr_vn, high_func_to_analyze, current_program)))
-                
-                if should_try_ref_man and func_manager_ref:
-                    ref_iter = current_program.getReferenceManager().getReferencesFrom(current_op_address, 0) # Check reference from instruction for call op index 0
-                    for ref in ref_iter:
-                        if ref.getReferenceType().isCall():
-                            ref_target_addr = ref.getToAddress()
-                            called_func_obj_from_ref = func_manager_ref.getFunctionAt(ref_target_addr)
-                            if called_func_obj_from_ref:
-                                println_func("DEBUG: [{} @ {}] Resolved {} via reference manager to function {} at {}.".format(
-                                    func_name, current_op_address_str, mnemonic, called_func_obj_from_ref.getName(), ref_target_addr))
-                                called_function_obj = called_func_obj_from_ref
-                                break # Take the first resolved call reference
+                except Exception as e_resolve_const:
+                    # println_func(f"DEBUG: Error resolving constant call target {target_func_addr_vn.getOffset():x}: {e_resolve_const}")
+                    pass # Silently continue if const resolution fails, will try ref manager
             
-            # Step 3: If function is resolved by any means above, proceed to analyze it
+            if called_function_obj is None and func_manager_ref: # Try Ghidra's reference manager
+                ref_iter = current_program.getReferenceManager().getReferencesFrom(current_op_address, 0)
+                for ref in ref_iter:
+                    if ref.getReferenceType().isCall():
+                        ref_target_addr = ref.getToAddress()
+                        func_from_ref = func_manager_ref.getFunctionAt(ref_target_addr)
+                        if func_from_ref:
+                            called_function_obj = func_from_ref
+                            break 
+            
+            if called_function_obj and called_function_obj.getName() == "memcpy":
+                if current_pcode_op.getNumInputs() >= 4: # Pcode inputs: 0:target, 1:dest, 2:src, 3:n
+                    dest_vn = current_pcode_op.getInput(1)
+                    src_vn = current_pcode_op.getInput(2)
+                    
+                    dest_hv = dest_vn.getHigh() if dest_vn else None
+                    src_hv = src_vn.getHigh() if src_vn else None
+                    
+                    src_is_tainted = False
+                    src_hv_repr_for_debug = "N/A"
+                    if src_hv:
+                        src_hv_repr_for_debug = get_varnode_representation(src_hv, high_func_to_analyze, current_program)
+                        if src_hv in tainted_high_vars_in_current_func or \
+                           src_hv_repr_for_debug in tainted_high_var_representations_in_current_func:
+                            src_is_tainted = True
+                            
+                    if src_is_tainted:
+                        memcpy_special_handling_applied = True 
+                        if dest_hv:
+                            dest_hv_repr = get_varnode_representation(dest_hv, high_func_to_analyze, current_program)
+                            if not (dest_hv in tainted_high_vars_in_current_func or \
+                                    dest_hv_repr in tainted_high_var_representations_in_current_func):
+                                tainted_high_vars_in_current_func.add(dest_hv)
+                                tainted_high_var_representations_in_current_func.add(dest_hv_repr)
+                                println_func("DEBUG: [memcpy Special Handling @ {} {}] Tainted src ({}) for memcpy. Marking dest '{}' as tainted.".format(
+                                    func_name, current_op_address_str,
+                                    src_hv_repr_for_debug,
+                                    dest_hv_repr
+                                ))
+                            else:
+                                println_func("DEBUG: [memcpy Special Handling @ {} {}] Tainted src ({}) for memcpy. Dest '{}' was already tainted.".format(
+                                    func_name, current_op_address_str,
+                                    src_hv_repr_for_debug,
+                                    dest_hv_repr
+                                ))
+                        else:
+                            printerr_func("WARN: [memcpy Special Handling @ {} {}] Tainted src ({}) for memcpy, but dest HighVariable could not be determined. Dest VN: {}".format(
+                                func_name, current_op_address_str, src_hv_repr_for_debug, dest_vn.toString() if dest_vn else "None"
+                            ))
+                else: 
+                    println_func("WARN: [memcpy Call @ {} {}] Not enough PCode inputs ({}) for standard memcpy (expected at least 4 for target, dest, src, n). Skipping special memcpy handling.".format(
+                        func_name, current_op_address_str, current_pcode_op.getNumInputs()
+                    ))
+
+            if memcpy_special_handling_applied:
+                println_func("DEBUG: [memcpy Special Handling @ {} {}] Applied. Skipping generic call processing for this memcpy.".format(
+                    func_name, current_op_address_str
+                ))
+                continue # Skip the rest of the generic call processing for this PCode op
+            # --- END SPECIAL MEMCPY HANDLING ---
+            
+            # Step 3: If function is resolved (and not memcpy that was specially handled), proceed to analyze it
             if called_function_obj:
                 high_called_func = None
                 try:
@@ -562,87 +661,53 @@ def trace_taint_in_function(
                     printerr_func("ERROR: Failed to decompile callee {}: {}".format(called_function_obj.getName(), de))
 
                 if high_called_func:
-                    # Get the ordered formal parameters of the callee function
-                    ordered_callee_formal_params = called_function_obj.getParameters() # Returns Parameter[]
+                    callee_func_proto = high_called_func.getFunctionPrototype()
+                    num_formal_params_in_callee = callee_func_proto.getNumParams() if callee_func_proto else 0
 
                     newly_tainted_callee_hvs = set()
-                    # mapped_conceptual_callee_param_indices = set() # To track if a conceptual slot is already mapped
 
-                    for pcode_arg_idx in range(1, current_pcode_op.getNumInputs()): # Iterate P-code args (0 is call target)
+                    for pcode_arg_idx in range(1, current_pcode_op.getNumInputs()): 
                         caller_arg_vn = current_pcode_op.getInput(pcode_arg_idx)
                         caller_arg_hv_in_caller_context = caller_arg_vn.getHigh()
 
                         if caller_arg_hv_in_caller_context and caller_arg_hv_in_caller_context in tainted_high_vars_in_current_func:
-                            # This P-code argument from the caller is tainted.
-                            # Map it to the callee's conceptual parameter based on order.
-                            conceptual_arg_index = pcode_arg_idx - 1 # 0-indexed
+                            conceptual_arg_index = pcode_arg_idx - 1 
 
-                            if conceptual_arg_index < len(ordered_callee_formal_params):
-                                target_formal_param = ordered_callee_formal_params[conceptual_arg_index]
+                            if callee_func_proto and conceptual_arg_index < num_formal_params_in_callee:
+                                callee_param_symbol_entry = callee_func_proto.getParam(conceptual_arg_index)
                                 hv_to_taint_in_callee = None
-                                try:
-                                    # target_formal_param is a ParameterDB object in this Ghidra version.
-                                    # We need to find the corresponding HighSymbol in the high_called_func's local symbol map.
-                                    found_matching_high_symbol = False
-                                    local_symbols_iter = high_called_func.getLocalSymbolMap().getSymbols()
-                                    while local_symbols_iter.hasNext():
-                                        high_symbol = local_symbols_iter.next()
-                                        if high_symbol.isParameter():
-                                            # Compare storage to link ParameterDB to HighSymbol
-                                            if high_symbol.getStorage().equals(target_formal_param.getVariableStorage()):
-                                                hv_to_taint_in_callee = high_symbol.getHighVariable()
-                                                found_matching_high_symbol = True
-                                                break 
-                                    if not found_matching_high_symbol:
-                                        # Fallback: attempt to match by name if storage did not yield a result (less reliable)
-                                        # Or if parameter storage is dynamic/complex and direct equals fails.
-                                        local_symbols_iter_name_fallback = high_called_func.getLocalSymbolMap().getSymbols()
-                                        while local_symbols_iter_name_fallback.hasNext():
-                                            high_symbol_fb = local_symbols_iter_name_fallback.next()
-                                            if high_symbol_fb.isParameter() and high_symbol_fb.getName() == target_formal_param.getName():
-                                                hv_to_taint_in_callee = high_symbol_fb.getHighVariable()
-                                                printerr_func("WARN: Matched param '{}' in {} to HighSymbol by NAME after storage match failed. This might be less reliable.".format(
-                                                    target_formal_param.getName(), high_called_func.getFunction().getName()))
-                                                found_matching_high_symbol = True # Set true here as well
-                                                break
-                                    
-                                    if not found_matching_high_symbol:
-                                         printerr_func("ERROR: [{} @ {}] Could not find matching HighSymbol for formal param '{}' (type: {}) in {} by storage or name.".format(
-                                            func_name, current_op_address_str, target_formal_param.getName(),
-                                            type(target_formal_param).__name__,
-                                            high_called_func.getFunction().getName()))
+                                formal_param_name_for_debug = "P{}_{}".format(conceptual_arg_index, "Unknown")
 
-                                except Exception as e_hv:
-                                    printerr_func("ERROR: [{} @ {}] Exception looking up HighSymbol for formal param '{}' (type: {}) in {}: {}".format(
-                                        func_name, current_op_address_str, target_formal_param.getName(),
-                                        type(target_formal_param).__name__,
-                                        high_called_func.getFunction().getName(), e_hv))
-
+                                if callee_param_symbol_entry:
+                                    formal_param_name_for_debug = callee_param_symbol_entry.getName()
+                                    hv_to_taint_in_callee = callee_param_symbol_entry.getHighVariable()
+                                
                                 if hv_to_taint_in_callee:
                                     newly_tainted_callee_hvs.add(hv_to_taint_in_callee)
-                                    # mapped_conceptual_callee_param_indices.add(conceptual_arg_index)
-                                    
-                                    println_func("INFO: [{} @ {}] Tainted PCode argument #{} (VN: {}) for {} to {}. Mapped to ordered callee param (concept_idx:{}, formal_name:'{}', HV:{}).".format(
+                                    println_func("INFO: [{} @ {}] Tainted PCode argument #{} (VN: {}) for {} to {}. Mapped to callee param (HighProto idx:{}, name:'{}', HV:{}).".format(
                                         func_name, current_op_address_str,
                                         pcode_arg_idx - 1, 
                                         get_varnode_representation(caller_arg_vn, high_func_to_analyze, current_program),
                                         mnemonic, called_function_obj.getName(),
                                         conceptual_arg_index,
-                                        target_formal_param.getName(),
+                                        formal_param_name_for_debug,
                                         get_varnode_representation(hv_to_taint_in_callee, high_called_func, current_program)
                                     ))
                                 else:
-                                    println_func("WARN: [{} @ {}] Tainted PCode argument #{} for {} to {}. Could not retrieve HighVariable for callee's formal param #{} (name: '{}').".format(
+                                    println_func("WARN: [{} @ {}] Tainted PCode argument #{} for {} to {}. Could not retrieve HighVariable for callee's HighProto param #{} (name: '{}').".format(
                                         func_name, current_op_address_str, pcode_arg_idx - 1,
                                         mnemonic, called_function_obj.getName(),
-                                        conceptual_arg_index, target_formal_param.getName()
+                                        conceptual_arg_index, formal_param_name_for_debug
                                     ))
                             else:
-                                # Number of PCode arguments exceeds number of formal parameters in callee (e.g. varargs)
-                                println_func("WARN: [{} @ {}] Tainted PCode argument #{} for {} to {}. Exceeds formal parameter count ({}) of callee. Cannot map (possibly varargs).".format(
+                                details_no_map = "Exceeds HighProto formal param count ({}) of callee {}.".format(num_formal_params_in_callee, called_function_obj.getName())
+                                if not callee_func_proto:
+                                    details_no_map = "Callee {} has no FunctionPrototype available.".format(called_function_obj.getName())
+                                
+                                println_func("WARN: [{} @ {}] Tainted PCode argument #{} for {} to {}. Cannot map ({}). Possibly varargs or prototype issue.".format(
                                     func_name, current_op_address_str, pcode_arg_idx - 1,
                                     mnemonic, called_function_obj.getName(),
-                                    len(ordered_callee_formal_params)
+                                    details_no_map
                                 ))
                     
                     if newly_tainted_callee_hvs:
@@ -679,11 +744,11 @@ def trace_taint_in_function(
                                 "function_name": func_name, "function_entry": func_entry_addr.toString(),
                                 "address": current_op_address.toString(), "pcode_op_str": str(current_pcode_op),
                                 "usage_type": "TAINTED_ARG_TO_CALL_NO_PARAM_MAP_OR_VARARGS",
-                                "details": "Tainted PCode args ({}) passed to {} ({}), but could not be mapped to formal params (or varargs). Callee formal param count: {}.".format(
+                                "details": "Tainted PCode args ({}) passed to {} ({}), but could not be mapped to HighProto formal params (or varargs). Callee HighProto formal param count: {}.".format(
                                     ", ".join(tainted_pcode_args_reprs),
                                     called_function_obj.getName(), 
                                     mnemonic,
-                                    len(ordered_callee_formal_params)
+                                    num_formal_params_in_callee # Use num_formal_params_in_callee here
                                 )
                             })
             
@@ -764,89 +829,55 @@ def trace_taint_in_function(
                         if high_attempted_func:
                             println_func("INFO: Successfully decompiled initially unresolved target {} at {} for {}.".format(
                                 attempted_func_obj.getName(), potential_target_addr_to_explore, mnemonic))
-                            newly_tainted_callee_hvs_attempt = set()
-                            callee_param_hvs_attempt = []
-                            lsm_callee_attempt = high_attempted_func.getLocalSymbolMap()
-                            if lsm_callee_attempt:
-                                sym_iter_callee_attempt = lsm_callee_attempt.getSymbols()
-                                while sym_iter_callee_attempt.hasNext():
-                                    sym_c_att = sym_iter_callee_attempt.next()
-                                    if sym_c_att.isParameter():
-                                        hv_c_att = sym_c_att.getHighVariable()
-                                        if hv_c_att: callee_param_hvs_attempt.append(hv_c_att)
                             
-                            any_tainted_arg_for_attempt = False # Renamed from newly_tainted_params_for_attempt to avoid confusion
-                            
-                            # Similar mapping logic for exploration path
-                            ordered_callee_formal_params_attempt = attempted_func_obj.getParameters()
+                            # Use HighFunctionPrototype for parameter mapping in exploration path
+                            attempted_callee_func_proto = high_attempted_func.getFunctionPrototype()
+                            num_formal_params_in_attempted_callee = attempted_callee_func_proto.getNumParams() if attempted_callee_func_proto else 0
                             newly_tainted_callee_hvs_attempt = set()
+                            any_tainted_arg_for_attempt = False
 
                             for arg_idx_pcode_attempt in range(1, current_pcode_op.getNumInputs()):
                                 arg_vn_attempt = current_pcode_op.getInput(arg_idx_pcode_attempt)
                                 arg_hv_attempt_in_caller = arg_vn_attempt.getHigh() if arg_vn_attempt else None
                                 if arg_hv_attempt_in_caller and arg_hv_attempt_in_caller in tainted_high_vars_in_current_func:
-                                    any_tainted_arg_for_attempt = True # Mark that at least one pcode arg was tainted
+                                    any_tainted_arg_for_attempt = True 
                                     conceptual_arg_index_attempt = arg_idx_pcode_attempt - 1
 
-                                    if conceptual_arg_index_attempt < len(ordered_callee_formal_params_attempt):
-                                        target_formal_param_attempt = ordered_callee_formal_params_attempt[conceptual_arg_index_attempt]
+                                    if attempted_callee_func_proto and conceptual_arg_index_attempt < num_formal_params_in_attempted_callee:
+                                        callee_param_symbol_entry_attempt = attempted_callee_func_proto.getParam(conceptual_arg_index_attempt)
                                         hv_to_taint_in_callee_attempt = None
-                                        try:
-                                            # Similar logic for the exploration path
-                                            found_matching_high_symbol_attempt = False
-                                            local_symbols_iter_attempt = high_attempted_func.getLocalSymbolMap().getSymbols()
-                                            while local_symbols_iter_attempt.hasNext():
-                                                high_symbol_att = local_symbols_iter_attempt.next()
-                                                if high_symbol_att.isParameter():
-                                                    if high_symbol_att.getStorage().equals(target_formal_param_attempt.getVariableStorage()):
-                                                        hv_to_taint_in_callee_attempt = high_symbol_att.getHighVariable()
-                                                        found_matching_high_symbol_attempt = True
-                                                        break
-                                            if not found_matching_high_symbol_attempt:
-                                                local_symbols_iter_name_fallback_attempt = high_attempted_func.getLocalSymbolMap().getSymbols()
-                                                while local_symbols_iter_name_fallback_attempt.hasNext():
-                                                    high_symbol_fb_att = local_symbols_iter_name_fallback_attempt.next()
-                                                    if high_symbol_fb_att.isParameter() and high_symbol_fb_att.getName() == target_formal_param_attempt.getName():
-                                                        hv_to_taint_in_callee_attempt = high_symbol_fb_att.getHighVariable()
-                                                        printerr_func("WARN: (Exploration Path) Matched param '{}' in {} to HighSymbol by NAME after storage match failed.".format(
-                                                            target_formal_param_attempt.getName(), high_attempted_func.getFunction().getName()))
-                                                        found_matching_high_symbol_attempt = True # Set true here
-                                                        break
-
-                                            if not found_matching_high_symbol_attempt:
-                                                printerr_func("ERROR: [{} @ {}] (Exploration Path) Could not find matching HighSymbol for formal param '{}' (type: {}) in {} by storage or name.".format(
-                                                    func_name, current_op_address_str, target_formal_param_attempt.getName(),
-                                                    type(target_formal_param_attempt).__name__,
-                                                    high_attempted_func.getFunction().getName()))
-
-                                        except Exception as e_hv_att:
-                                            printerr_func("ERROR: [{} @ {}] Exception looking up HighSymbol for formal param '{}' (type: {}) in explored {}: {}".format(
-                                                func_name, current_op_address_str, target_formal_param_attempt.getName(),
-                                                type(target_formal_param_attempt).__name__,
-                                                high_attempted_func.getFunction().getName(), e_hv_att))
+                                        formal_param_name_for_debug_attempt = "P{}_{}".format(conceptual_arg_index_attempt, "Unknown")
+                                        
+                                        if callee_param_symbol_entry_attempt:
+                                            formal_param_name_for_debug_attempt = callee_param_symbol_entry_attempt.getName()
+                                            hv_to_taint_in_callee_attempt = callee_param_symbol_entry_attempt.getHighVariable()
 
                                         if hv_to_taint_in_callee_attempt:
                                             newly_tainted_callee_hvs_attempt.add(hv_to_taint_in_callee_attempt)
-                                            println_func("INFO: [{} @ {}] Tainted PCode argument #{} (VN: {}) for {} to explored {}. Mapped to ordered callee param (concept_idx:{}, formal_name:'{}', HV:{}).".format(
+                                            println_func("INFO: [{} @ {}] Tainted PCode argument #{} (VN: {}) for {} to explored {}. Mapped to callee HighProto param (idx:{}, name:'{}', HV:{}).".format(
                                                 func_name, current_op_address_str,
                                                 arg_idx_pcode_attempt - 1,
                                                 get_varnode_representation(arg_vn_attempt, high_func_to_analyze, current_program),
                                                 mnemonic, attempted_func_obj.getName(),
                                                 conceptual_arg_index_attempt,
-                                                target_formal_param_attempt.getName(),
+                                                formal_param_name_for_debug_attempt,
                                                 get_varnode_representation(hv_to_taint_in_callee_attempt, high_attempted_func, current_program)
                                             ))
                                         else:
-                                            println_func("WARN: [{} @ {}] Tainted PCode argument #{} for {} to explored {}. Could not retrieve HighVariable for callee's formal param #{} (name: '{}').".format(
+                                            println_func("WARN: [{} @ {}] Tainted PCode argument #{} for {} to explored {}. Could not retrieve HighVariable for callee's HighProto param #{} (name: '{}').".format(
                                                 func_name, current_op_address_str, arg_idx_pcode_attempt - 1,
                                                 mnemonic, attempted_func_obj.getName(),
-                                                conceptual_arg_index_attempt, target_formal_param_attempt.getName()
+                                                conceptual_arg_index_attempt, formal_param_name_for_debug_attempt
                                             ))
                                     else:
-                                        println_func("WARN: [{} @ {}] Tainted PCode argument #{} for {} to explored {}. Exceeds formal param count ({}) of callee. Cannot map (possibly varargs).".format(
+                                        details_no_map_attempt = "Exceeds HighProto formal param count ({}) of explored callee {}.".format(num_formal_params_in_attempted_callee, attempted_func_obj.getName())
+                                        if not attempted_callee_func_proto:
+                                            details_no_map_attempt = "Explored callee {} has no FunctionPrototype available.".format(attempted_func_obj.getName())
+
+                                        println_func("WARN: [{} @ {}] Tainted PCode argument #{} for {} to explored {}. Cannot map ({}). Possibly varargs or prototype issue.".format(
                                             func_name, current_op_address_str, arg_idx_pcode_attempt - 1,
                                             mnemonic, attempted_func_obj.getName(),
-                                            len(ordered_callee_formal_params_attempt)
+                                            details_no_map_attempt
                                         ))
                             
                             if newly_tainted_callee_hvs_attempt:
@@ -874,11 +905,11 @@ def trace_taint_in_function(
                                     "function_name": func_name, "function_entry": func_entry_addr.toString(),
                                     "address": current_op_address.toString(), "pcode_op_str": str(current_pcode_op),
                                     "usage_type": "TAINTED_ARG_TO_EXPLORED_CALL_NO_PARAM_MAP", # Changed from TAINTED_ARG_TO_RESOLVED_CALL_NO_PARAM_MAP
-                                    "details": "Tainted arg to {} to explored/resolved {} ({}), but could not map to its parameters. Callee formal param count: {}.".format(
+                                    "details": "Tainted arg to {} to explored/resolved {} ({}), but could not map to its HighProto parameters. Callee HighProto formal param count: {}.".format(
                                         mnemonic, 
                                         attempted_func_obj.getName(), 
                                         exploration_context_msg,
-                                        len(ordered_callee_formal_params_attempt) # Add count of formal params for context
+                                        num_formal_params_in_attempted_callee 
                                         )
                                 })
                         else: 
@@ -901,21 +932,25 @@ def trace_taint_in_function(
 
         # --- TAINT PROPAGATION ---
         if output_hv and output_hv not in tainted_high_vars_in_current_func:
-            is_newly_tainted_by_this_op = False
-            source_of_taint_for_this_op_repr = "N/A"
-            input_vn_that_caused_taint = None # Store the varnode that caused the taint for logging
+            # This block is entered if output_hv exists and is not already in the main tainted set.
+            # We will determine if its inputs would cause it to become tainted.
             
+            is_newly_tainted_by_this_op_due_to_inputs = False 
+            source_of_taint_if_propagated = "N/A"
+            input_vn_causing_taint_if_propagated = None
+
+            # Determine if any input to current_pcode_op is tainted
             unary_like_propagation_ops = ["COPY", "CAST", "INT_NEGATE", "INT_2COMP", "POPCOUNT", "INT_ZEXT", "INT_SEXT", "FLOAT_NEG", "FLOAT_ABS", "FLOAT_SQRT", "FLOAT2FLOAT", "TRUNC", "CEIL", "FLOOR", "ROUND", "INT2FLOAT", "FLOAT2INT", "BOOL_NEGATE"]
             multi_input_propagation_ops = ["INT_ADD", "INT_SUB", "INT_MULT", "INT_DIV", "INT_SDIV", "INT_REM", "INT_SREM", "INT_AND", "INT_OR", "INT_XOR", "INT_LEFT", "INT_RIGHT", "INT_SRIGHT", "INT_EQUAL", "INT_NOTEQUAL", "INT_LESS", "INT_SLESS", "INT_LESSEQUAL", "INT_SLESSEQUAL", "INT_CARRY", "INT_SCARRY", "INT_SBORROW", "FLOAT_ADD", "FLOAT_SUB", "FLOAT_MULT", "FLOAT_DIV", "FLOAT_EQUAL", "FLOAT_NOTEQUAL", "FLOAT_LESS", "FLOAT_LESSEQUAL", "BOOL_XOR", "BOOL_AND", "BOOL_OR", "MULTIEQUAL", "PIECE", "SUBPIECE"]
             load_op = "LOAD"
-
             inputs_to_check_for_taint = []
+
             if mnemonic == load_op and current_pcode_op.getNumInputs() > 1:
-                inputs_to_check_for_taint.append(current_pcode_op.getInput(1)) # LOAD source is input 1 (pointer)
+                inputs_to_check_for_taint.append(current_pcode_op.getInput(1))
             elif mnemonic in unary_like_propagation_ops and current_pcode_op.getNumInputs() > 0:
                 inputs_to_check_for_taint.append(current_pcode_op.getInput(0))
             elif mnemonic in multi_input_propagation_ops:
-                if mnemonic == "SUBPIECE" and current_pcode_op.getNumInputs() > 0: # SUBPIECE only taints from its first input
+                if mnemonic == "SUBPIECE" and current_pcode_op.getNumInputs() > 0:
                     inputs_to_check_for_taint.append(current_pcode_op.getInput(0))
                 else:
                     for i in range(current_pcode_op.getNumInputs()):
@@ -924,77 +959,155 @@ def trace_taint_in_function(
             for input_vn_to_check in inputs_to_check_for_taint:
                 if input_vn_to_check:
                     input_hv_to_check = input_vn_to_check.getHigh()
-                    if input_hv_to_check: # Ensure HighVariable exists for the input
-                        input_is_considered_tainted = False
-                        current_input_hv_repr = get_varnode_representation(input_hv_to_check, high_func_to_analyze, current_program)
-
-                        if mnemonic == load_op:
-                            # For LOAD, check if the *pointer's representation* is in the tainted representations set
-                            if current_input_hv_repr in tainted_high_var_representations_in_current_func:
-                                input_is_considered_tainted = True
-                                source_of_taint_for_this_op_repr = current_input_hv_repr 
-                        elif input_hv_to_check in tainted_high_vars_in_current_func:
-                            # For other operations, check if the input HighVariable object itself is in the tainted set
-                            input_is_considered_tainted = True
-                            source_of_taint_for_this_op_repr = current_input_hv_repr
+                    if input_hv_to_check:
+                        current_input_hv_repr_check = get_varnode_representation(input_hv_to_check, high_func_to_analyze, current_program)
+                        is_this_input_tainted = False
+                        if mnemonic == load_op: # For LOAD, output_hv is the loaded value. Taint if pointer (input_hv_to_check) is tainted.
+                            # This interpretation means the *pointer itself* (input_hv_to_check) being in tainted_high_vars_in_current_func
+                            # or its representation being in tainted_high_var_representations_in_current_func.
+                            # The provided logic used tainted_high_var_representations_in_current_func for LOAD's pointer.
+                            if current_input_hv_repr_check in tainted_high_var_representations_in_current_func:
+                                is_this_input_tainted = True
+                        elif input_hv_to_check in tainted_high_vars_in_current_func: # For other ops, check direct HV
+                            is_this_input_tainted = True
                         
-                        if input_is_considered_tainted:
-                            is_newly_tainted_by_this_op = True
-                            input_vn_that_caused_taint = input_vn_to_check # Save for logging
-                            tainted_high_vars_in_current_func.add(output_hv)
-                            
-                            output_hv_repr_for_set = get_varnode_representation(output_hv, high_func_to_analyze, current_program)
-                            tainted_high_var_representations_in_current_func.add(output_hv_repr_for_set)
-                            
-                            # println_func is deferred until after the loop to ensure correct source_of_taint_for_this_op_repr
-                            break # Found a tainted input for this op, output is now tainted
+                        if is_this_input_tainted:
+                            is_newly_tainted_by_this_op_due_to_inputs = True
+                            source_of_taint_if_propagated = current_input_hv_repr_check
+                            input_vn_causing_taint_if_propagated = input_vn_to_check
+                            break 
             
-            if is_newly_tainted_by_this_op:
-                # Ensure input_vn_that_caused_taint is not None before trying to get its representation
-                # source_of_taint_for_this_op_repr should already be set correctly from the loop
-                full_input_vn_repr = get_varnode_representation(input_vn_that_caused_taint, high_func_to_analyze, current_program) if input_vn_that_caused_taint else "N/A (Error)"
+            if is_newly_tainted_by_this_op_due_to_inputs:
+                # At this point, output_hv *would* be tainted by its inputs.
+                # Now, check for suppression conditions.
+                should_actually_add_taint = True
 
-                println_func("DEBUG: [{} @ {}] Taint propagated from {} ({}) to {} ({}) via {}.".format(
-                    func_name, current_op_address_str,
-                    source_of_taint_for_this_op_repr, 
-                    full_input_vn_repr,
-                    get_varnode_representation(output_hv, high_func_to_analyze, current_program), 
-                    get_varnode_representation(output_vn, high_func_to_analyze, current_program), 
-                    mnemonic
-                ))
-                        
-                if output_hv in current_func_input_param_hvs and output_hv not in initial_tainted_hvs:
-                    details_param_term = "Taint propagated to input parameter {} of function {}.".format(
-                        get_varnode_representation(output_hv, high_func_to_analyze, current_program), func_name
-                    )
-                    calling_functions_info = []
-                    function_being_analyzed = high_func_to_analyze.getFunction()
-                    if func_manager_ref: 
-                        references_to_function = current_program.getReferenceManager().getReferencesTo(function_being_analyzed.getEntryPoint())
-                        for ref in references_to_function:
-                            if ref.getReferenceType().isCall():
-                                caller_func = func_manager_ref.getFunctionContaining(ref.getFromAddress())
-                                if caller_func:
-                                    calling_functions_info.append("{} at {}".format(caller_func.getName(), caller_func.getEntryPoint().toString()))
-                    if calling_functions_info:
-                        details_param_term += " Called by: [{}].".format(", ".join(calling_functions_info))
-                    else:
-                        details_param_term += " No direct callers found in program."
-
-                    all_tainted_usages.append({
-                        "function_name": func_name, "function_entry": func_entry_addr.toString(),
-                        "address": current_op_address.toString(), "pcode_op_str": str(current_pcode_op),
-                        "usage_type": "TAINT_REACHED_INPUT_PARAMETER_TERMINATION",
-                        "tainted_component_repr": get_varnode_representation(output_hv, high_func_to_analyze, current_program),
-                        "details": details_param_term
-                    })
-                    println_func("INFO: [{} @ {}] {}. Analysis path terminated.".format(
-                        func_name, current_op_address_str, details_param_term
+                # NEW: General suppression for strlen output
+                is_strlen_call_producing_this_output_hv = False
+                if mnemonic in ["CALL", "CALLIND"] and output_vn and output_vn.getHigh() == output_hv: # Check if output_hv is the direct output of this PcodeOp
+                    # Resolve called_function_obj_for_current_op (similar logic as in recursive call handling)
+                    called_func_for_strlen_check = None
+                    target_vn_strlen = current_pcode_op.getInput(0)
+                    if mnemonic == "CALL" and target_vn_strlen.isConstant():
+                        try:
+                            addr_strlen = current_program.getAddressFactory().getAddress(hex(target_vn_strlen.getOffset()))
+                            if addr_strlen and func_manager_ref:
+                                called_func_for_strlen_check = func_manager_ref.getFunctionAt(addr_strlen)
+                        except: pass
+                    elif func_manager_ref: # For CALLIND or non-const CALL target
+                        ref_iter_strlen = current_program.getReferenceManager().getReferencesFrom(current_op_address, 0)
+                        for ref_strlen in ref_iter_strlen:
+                            if ref_strlen.getReferenceType().isCall():
+                                func_from_ref_strlen = func_manager_ref.getFunctionAt(ref_strlen.getToAddress())
+                                if func_from_ref_strlen:
+                                    called_func_for_strlen_check = func_from_ref_strlen
+                                    break 
+                    
+                    if called_func_for_strlen_check and called_func_for_strlen_check.getName() == "strlen":
+                        is_strlen_call_producing_this_output_hv = True
+                
+                if is_strlen_call_producing_this_output_hv:
+                    println_func("DEBUG: [MODIFIED STRLEN TAINTING {} @ {}] Output HV {} of strlen CALL will NOT be directly tainted by its inputs. (Length value itself not considered a propagating taint).".format(
+                        func_name, current_op_address_str,
+                        get_varnode_representation(output_hv, high_func_to_analyze, current_program)
                     ))
-                    return 
+                    should_actually_add_taint = False
+                else:
+                    # ORIGINAL STRLEN SUPPRESSION FOR CONSTANT STRINGS (Applies if not already suppressed by the general rule above)
+                    # This check is now more of a secondary or alternative suppression.
+                    if mnemonic in ["CALL", "CALLIND"]:
+                        # Resolve the called function for the current PCode op
+                        called_func_for_suppression_check = None # Re-resolve, or use a common resolution if available from above
+                        # If called_func_for_strlen_check was resolved and was not strlen, it could be reused here.
+                        # For safety, resolving again or ensuring it's correctly scoped if reused.
+                        # Let's assume re-resolution for clarity if not already suppressed.
+                        if should_actually_add_taint: # Only check this if general strlen rule didn't apply or didn't suppress
+                            target_vn_suppress = current_pcode_op.getInput(0)
+                            if mnemonic == "CALL" and target_vn_suppress.isConstant():
+                                try:
+                                    addr_suppress = current_program.getAddressFactory().getAddress(hex(target_vn_suppress.getOffset()))
+                                    if addr_suppress and func_manager_ref: 
+                                        called_func_for_suppression_check = func_manager_ref.getFunctionAt(addr_suppress)
+                                except: pass
+                            elif func_manager_ref: 
+                                ref_iter_suppress = current_program.getReferenceManager().getReferencesFrom(current_op_address, 0)
+                                for ref_suppress in ref_iter_suppress:
+                                    if ref_suppress.getReferenceType().isCall():
+                                        func_from_ref_suppress = func_manager_ref.getFunctionAt(ref_suppress.getToAddress())
+                                        if func_from_ref_suppress:
+                                            called_func_for_suppression_check = func_from_ref_suppress
+                                            break
+                            
+                            if called_func_for_suppression_check and called_func_for_suppression_check.getName() == "strlen":
+                                if current_pcode_op.getNumInputs() > 1: 
+                                    strlen_input_string_vn = current_pcode_op.getInput(1) 
+                                    is_likely_const_strlen_input = False
+                                    if strlen_input_string_vn.isConstant():
+                                        is_likely_const_strlen_input = True
+                                    else:
+                                        def_op_strlen_input = strlen_input_string_vn.getDef()
+                                        if def_op_strlen_input and def_op_strlen_input.getMnemonic() == "LOAD":
+                                            loaded_from_addr_vn = def_op_strlen_input.getInput(1)
+                                            if loaded_from_addr_vn.isConstant():
+                                                is_likely_const_strlen_input = True
+                                    
+                                    if is_likely_const_strlen_input: # This 'if' implies should_actually_add_taint is still True
+                                        println_func("DEBUG: [ORIGINAL STRLEN CONST SUPPRESSION {} @ {}] Output HV {} of current strlen CALL on likely const string will NOT be tainted.".format(
+                                            func_name, current_op_address_str,
+                                            get_varnode_representation(output_hv, high_func_to_analyze, current_program)
+                                        ))
+                                        should_actually_add_taint = False
+                
+                if should_actually_add_taint:
+                    tainted_high_vars_in_current_func.add(output_hv)
+                    output_hv_repr_for_set = get_varnode_representation(output_hv, high_func_to_analyze, current_program)
+                    tainted_high_var_representations_in_current_func.add(output_hv_repr_for_set)
+                    
+                    full_input_vn_repr = get_varnode_representation(input_vn_causing_taint_if_propagated, high_func_to_analyze, current_program) if input_vn_causing_taint_if_propagated else "N/A (Error)"
+                    println_func("DEBUG: [{} @ {}] Taint propagated from {} ({}) to {} ({}) via {}.".format(
+                        func_name, current_op_address_str,
+                        source_of_taint_if_propagated,
+                        full_input_vn_repr,
+                        output_hv_repr_for_set,
+                        get_varnode_representation(output_vn, high_func_to_analyze, current_program),
+                        mnemonic
+                    ))
+
+        # --- TAINT_REACHED_INPUT_PARAMETER_TERMINATION check ---
+        # This uses the final state of output_hv for the current_pcode_op
+        if output_hv and output_hv in tainted_high_vars_in_current_func:
+            if output_hv in current_func_input_param_hvs and output_hv not in initial_tainted_hvs:
+                details_param_term = "Taint propagated to input parameter {} of function {}.".format(
+                    get_varnode_representation(output_hv, high_func_to_analyze, current_program), func_name
+                )
+                calling_functions_info = []
+                function_being_analyzed = high_func_to_analyze.getFunction()
+                if func_manager_ref: 
+                    references_to_function = current_program.getReferenceManager().getReferencesTo(function_being_analyzed.getEntryPoint())
+                    for ref in references_to_function:
+                        if ref.getReferenceType().isCall():
+                            caller_func = func_manager_ref.getFunctionContaining(ref.getFromAddress())
+                            if caller_func:
+                                calling_functions_info.append("{} at {}".format(caller_func.getName(), caller_func.getEntryPoint().toString()))
+                if calling_functions_info:
+                    details_param_term += " Called by: [{}].".format(", ".join(calling_functions_info))
+                else:
+                    details_param_term += " No direct callers found in program."
+
+                all_tainted_usages.append({
+                    "function_name": func_name, "function_entry": func_entry_addr.toString(),
+                    "address": current_op_address.toString(), "pcode_op_str": str(current_pcode_op),
+                    "usage_type": "TAINT_REACHED_INPUT_PARAMETER_TERMINATION",
+                    "tainted_component_repr": get_varnode_representation(output_hv, high_func_to_analyze, current_program),
+                    "details": details_param_term
+                })
+                println_func("INFO: [{} @ {}] {}. Analysis path terminated.".format(
+                    func_name, current_op_address_str, details_param_term
+                ))
+                return 
 
     println_func("<<< Finished analyzing function: {}. Final tainted HighVariables in this scope: {}".format(
-        func_name, ", ".join([get_varnode_representation(hv, high_func_to_analyze, current_program) for hv in tainted_high_vars_in_current_func]) if tainted_high_vars_in_current_func else "None"
+        func_name, ", ".join(sorted([get_varnode_representation(hv, high_func_to_analyze, current_program) for hv in tainted_high_vars_in_current_func])) if tainted_high_vars_in_current_func else "None"
     ))
 
 # Helper function to avoid code duplication for logging TAINTED_ARG_TO_UNRESOLVED_CALL
@@ -1302,7 +1415,6 @@ try:
                     println("No initial taint source could be established for original method. Analysis not started.")
         elif not analysis_performed_via_new_method : # If new method also didn't run, and old method didn't set an initial_function_obj
              printerr("CRITICAL ERROR: No initial function could be determined by any method. Script cannot start analysis.")
-
 
     # --- Print final results ---
     # This part is outside the 'if not analysis_performed_via_new_method' block, so it prints combined results
