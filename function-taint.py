@@ -1,4 +1,4 @@
-# -- coding: utf-8 -*-
+
 # ARMv8TaintTracer_Combined_Sourcing_V2.py
 # MODIFIED FOR VALUE TAINT TRACKING & ENHANCED STORE ANALYSIS
 # VERSION: Combined Taint Sourcing with Corrected P-code Mnemonics and Enhanced Store Classification
