@@ -1011,6 +1011,24 @@ def resolve_varnode_to_constant(vn_to_resolve, func_hf, current_prog_ref, printl
     if vn_to_resolve is None:
         return None
 
+    # --- Added Detailed Print --- 
+    raw_vn_str = vn_to_resolve.toString()
+    hv_for_vn = vn_to_resolve.getHigh()
+    hv_repr_for_debug = "None" 
+    if hv_for_vn:
+        # Use the main get_varnode_representation for consistency if possible, 
+        # but ensure func_hf and current_prog_ref are available or pass them.
+        # For a quick local debug, can just get name and storage.
+        hv_name = hv_for_vn.getName() if hv_for_vn.getName() else "UnnamedHighVar"
+        try:
+            storage_info = hv_for_vn.getStorage().toString() if hv_for_vn.getStorage() else "NoStorage"
+            hv_repr_for_debug = "%s(%s)" % (hv_name, storage_info)
+        except:
+            hv_repr_for_debug = "%s(ErrorGettingStorage)" % hv_name
+    
+    println_func("      [CONST_RESOLVE_DEBUG] Enter resolve_varnode_to_constant. Raw VN: %s, HV Repr: %s" % (raw_vn_str, hv_repr_for_debug))
+    # --- End Detailed Print ---
+
     if _visited_vns_for_resolve is None:
         _visited_vns_for_resolve = set()
 
@@ -1065,15 +1083,136 @@ def resolve_varnode_to_constant(vn_to_resolve, func_hf, current_prog_ref, printl
             not mem_addr_obj.isRegisterAddress() and
             not mem_addr_obj.isStackAddress() and
             not mem_addr_obj.isConstantAddress()): # Excludes 'const' space, focuses on RAM/Code
-            println_func("          [CONST_RESOLVE_DEBUG] %s has no def op, but IS a direct memory address: %s. Returning its offset: %#x" % (vn_repr_for_debug, mem_addr_obj, mem_addr_obj.getOffset()))
-            return mem_addr_obj.getOffset() 
-        println_func("          [CONST_RESOLVE_DEBUG] %s has no def op and is not a resolvable direct memory address. Returning None." % vn_repr_for_debug)
-        return None 
+            println_func("          [CONST_RESOLVE_DEBUG] %s has no def op, IS a direct memory address: %s. Attempting to read from this address." % (vn_repr_for_debug, mem_addr_obj))
+            try:
+                val_size = vn_to_resolve.getSize()
+                loaded_value = None
+                mem = current_prog_ref.getMemory()
+                # mem_addr_obj is already a Ghidra Address object
+
+                if val_size == 8: loaded_value = mem.getLong(mem_addr_obj)
+                elif val_size == 4: loaded_value = mem.getInt(mem_addr_obj) # & 0xFFFFFFFF
+                elif val_size == 2: loaded_value = mem.getShort(mem_addr_obj) # & 0xFFFF
+                elif val_size == 1: loaded_value = mem.getByte(mem_addr_obj) # & 0xFF
+                else:
+                    println_func("            [CONST_RESOLVE_DEBUG] Read from direct memory address %s of unhandled size %d." % (mem_addr_obj, val_size))
+                    return None
+                println_func("            [CONST_RESOLVE_DEBUG] Read from direct memory address %s (size %d) resolved to value: %#x" % (mem_addr_obj, val_size, loaded_value))
+                return loaded_value & 0xFFFFFFFFFFFFFFFF # Ensure 64-bit unsigned
+            except Exception as e_mem_direct:
+                println_func("            [CONST_RESOLVE_DEBUG] Error reading memory for direct address %s: %s" % (mem_addr_obj, str(e_mem_direct)))
+                return None
+        println_func("          [CONST_RESOLVE_DEBUG] %s has no def op and is not a resolvable direct memory address (or not a standard RAM address). Returning None." % vn_repr_for_debug)
+        return None
 
     op_mnemonic = def_op.getMnemonic()
     println_func("        [CONST_RESOLVE_DEBUG] Defining op for %s is %s at %s." % (vn_repr_for_debug, op_mnemonic, def_op.getSeqnum().getTarget()))
 
-    if op_mnemonic == "COPY" or op_mnemonic == "CAST":
+    if op_mnemonic == "LOAD":
+        load_addr_vn = def_op.getInput(1) # Varnode representing the address to load from
+        # Input 0 is the space ID, input 1 is the address varnode
+        println_func("          [CONST_RESOLVE_DEBUG] %s from LOAD. Tracing load address: %s" % (vn_repr_for_debug, get_varnode_representation(load_addr_vn, func_hf, current_prog_ref)))
+        
+        resolved_load_addr_const = resolve_varnode_to_constant(load_addr_vn, func_hf, current_prog_ref, println_func, max_depth - 1, _visited_vns_for_resolve.copy())
+        
+        if resolved_load_addr_const is not None:
+            try:
+                load_address_long = long(resolved_load_addr_const)
+                ghidra_load_addr = current_prog_ref.getAddressFactory().getDefaultAddressSpace().getAddress(load_address_long)
+                val_size = vn_to_resolve.getSize()
+                loaded_value = None
+                mem = current_prog_ref.getMemory()
+                if val_size == 8: loaded_value = mem.getLong(ghidra_load_addr)
+                elif val_size == 4: loaded_value = mem.getInt(ghidra_load_addr) # & 0xFFFFFFFF
+                elif val_size == 2: loaded_value = mem.getShort(ghidra_load_addr) # & 0xFFFF
+                elif val_size == 1: loaded_value = mem.getByte(ghidra_load_addr) # & 0xFF
+                else:
+                    println_func("            [CONST_RESOLVE_DEBUG] LOAD of unhandled size %d for %s from %#x." % (val_size, vn_repr_for_debug, load_address_long))
+                    return None
+                println_func("            [CONST_RESOLVE_DEBUG] LOAD from %#x (size %d) resolved to value: %#x" % (load_address_long, val_size, loaded_value))
+                return loaded_value & 0xFFFFFFFFFFFFFFFF
+            except Exception as e_mem:
+                println_func("            [CONST_RESOLVE_DEBUG] Error reading memory for LOAD of %s from %#x: %s" % (vn_repr_for_debug, resolved_load_addr_const, str(e_mem)))
+                return None
+        else:
+            println_func("            [CONST_RESOLVE_DEBUG] LOAD address %s for %s did not resolve to constant." % (get_varnode_representation(load_addr_vn, func_hf, current_prog_ref), vn_repr_for_debug))
+            return None
+    
+    elif op_mnemonic == "INDIRECT":
+        # Heuristic: If the varnode defined by INDIRECT is itself a direct memory address,
+        # it might mean we need the value AT that address, especially if it's a global.
+        if vn_to_resolve.isAddress() and vn_to_resolve.getAddress().isMemoryAddress() and not vn_to_resolve.getAddress().isStackAddress():
+            direct_mem_addr = vn_to_resolve.getAddress()
+            println_func("          [CONST_RESOLVE_DEBUG] %s from INDIRECT, and is a direct memory address: %s. Attempting direct memory read from this address." % (vn_repr_for_debug, direct_mem_addr))
+            try:
+                load_address_long = long(direct_mem_addr.getOffset())
+                # Determine the size to read. Often, if a global address is used as a value, it's a pointer.
+                # We'll use the size of vn_to_resolve itself, defaulting to pointer size (8 for ARM64) if ambiguous.
+                read_size = vn_to_resolve.getSize()
+                if read_size not in [1, 2, 4, 8]: # Default to 8 for pointers if size is unusual (e.g. from HighOther)
+                    println_func("            [CONST_RESOLVE_DEBUG] INDIRECT (address) read for %s had unusual size %d, defaulting to 8." % (vn_repr_for_debug, read_size))
+                    read_size = 8 
+                
+                loaded_value = None
+                mem = current_prog_ref.getMemory()
+
+                if read_size == 8: loaded_value = mem.getLong(direct_mem_addr)
+                elif read_size == 4: loaded_value = mem.getInt(direct_mem_addr)
+                elif read_size == 2: loaded_value = mem.getShort(direct_mem_addr)
+                elif read_size == 1: loaded_value = mem.getByte(direct_mem_addr)
+                else: # Should be caught by default above
+                    println_func("            [CONST_RESOLVE_DEBUG] INDIRECT (address) read of unhandled/defaulted size %d for %s." % (read_size, vn_repr_for_debug))
+                    return None
+                
+                println_func("            [CONST_RESOLVE_DEBUG] INDIRECT (address) read from %s (offset %#x, size %d) resolved to value: %#x" % (direct_mem_addr, load_address_long, read_size, loaded_value))
+                return loaded_value & 0xFFFFFFFFFFFFFFFF # Ensure 64-bit unsigned for pointers
+            except Exception as e_mem_indirect:
+                println_func("            [CONST_RESOLVE_DEBUG] Error reading memory for INDIRECT (address) %s: %s" % (direct_mem_addr, str(e_mem_indirect)))
+                return None
+        else:
+            # Fallback to previous (less effective) INDIRECT handling if the above heuristic doesn't apply
+            effect_op_ref_vn = def_op.getInput(1) 
+            actual_effect_op = None
+            if effect_op_ref_vn.isConstant():
+                target_op_ref_offset = effect_op_ref_vn.getOffset()
+                # Search within the same instruction as the INDIRECT op (original limited heuristic)
+                instr_address_of_indirect = def_op.getSeqnum().getTarget()
+                ops_at_instr_addr_iter = func_hf.getPcodeOps(instr_address_of_indirect)
+                while ops_at_instr_addr_iter.hasNext():
+                    candidate_op = ops_at_instr_addr_iter.next()
+                    if candidate_op.getOutput() and candidate_op.getOutput().equals(vn_to_resolve) and candidate_op.getMnemonic() == "LOAD":
+                        actual_effect_op = candidate_op
+                        break
+                    if not actual_effect_op and candidate_op.getSeqnum().getTime() == target_op_ref_offset: # Match by time
+                        actual_effect_op = candidate_op 
+            
+            if actual_effect_op and actual_effect_op.getMnemonic() == "LOAD":
+                println_func("          [CONST_RESOLVE_DEBUG] %s from INDIRECT effect of LOAD (fallback heuristic): %s. Tracing this LOAD." % (vn_repr_for_debug, actual_effect_op))
+                load_addr_vn_from_indirect = actual_effect_op.getInput(1)
+                # (rest of LOAD logic as before)
+                resolved_load_addr_const_indirect = resolve_varnode_to_constant(load_addr_vn_from_indirect, func_hf, current_prog_ref, println_func, max_depth - 1, _visited_vns_for_resolve.copy())
+                if resolved_load_addr_const_indirect is not None:
+                    try:
+                        load_address_long_indirect = long(resolved_load_addr_const_indirect)
+                        val_size_indirect = vn_to_resolve.getSize()
+                        loaded_value_indirect = None
+                        mem_indirect = current_prog_ref.getMemory()
+                        if val_size_indirect == 8: loaded_value_indirect = mem_indirect.getLong(current_prog_ref.getAddressFactory().getDefaultAddressSpace().getAddress(load_address_long_indirect))
+                        elif val_size_indirect == 4: loaded_value_indirect = mem_indirect.getInt(current_prog_ref.getAddressFactory().getDefaultAddressSpace().getAddress(load_address_long_indirect))
+                        # ... (add short and byte if necessary, ensure address creation)
+                        else:
+                            println_func("            [CONST_RESOLVE_DEBUG] INDIRECT->LOAD (fallback) of unhandled size %d." % val_size_indirect); return None
+                        println_func("            [CONST_RESOLVE_DEBUG] INDIRECT->LOAD (fallback) from %#x (size %d) value: %#x" % (load_address_long_indirect, val_size_indirect, loaded_value_indirect))
+                        return loaded_value_indirect & 0xFFFFFFFFFFFFFFFF
+                    except Exception as e_mem_indirect_fb:
+                        println_func("            [CONST_RESOLVE_DEBUG] Error reading memory for INDIRECT->LOAD (fallback): %s" % str(e_mem_indirect_fb)); return None
+                else:
+                    println_func("            [CONST_RESOLVE_DEBUG] INDIRECT->LOAD (fallback) address %s did not resolve." % get_varnode_representation(load_addr_vn_from_indirect, func_hf, current_prog_ref)); return None
+            else:
+                println_func("          [CONST_RESOLVE_DEBUG] Could not resolve INDIRECT effect for %s to a LOAD operation using fallback heuristic (actual_effect_op: %s)." % (vn_repr_for_debug, actual_effect_op.getMnemonic() if actual_effect_op else "None"))
+                return None
+
+    elif op_mnemonic == "COPY" or op_mnemonic == "CAST":
         input_vn = def_op.getInput(0)
         println_func("          [CONST_RESOLVE_DEBUG] %s from %s. Tracing input: %s" % (op_mnemonic, vn_repr_for_debug, get_varnode_representation(input_vn, func_hf, current_prog_ref)))
         return resolve_varnode_to_constant(input_vn, func_hf, current_prog_ref, println_func, max_depth - 1, _visited_vns_for_resolve)
@@ -1081,19 +1220,32 @@ def resolve_varnode_to_constant(vn_to_resolve, func_hf, current_prog_ref, printl
     elif op_mnemonic in ["INT_ADD", "PTRADD"]:
         input0_vn = def_op.getInput(0)
         input1_vn = def_op.getInput(1)
-        println_func("          [CONST_RESOLVE_DEBUG] %s for %s. Input0: %s, Input1: %s" % (op_mnemonic, vn_repr_for_debug, get_varnode_representation(input0_vn, func_hf, current_prog_ref), get_varnode_representation(input1_vn, func_hf, current_prog_ref)))
         
+        # --- Enhanced Debug Prints for ADD/PTRADD inputs ---
+        input0_def_op_str = str(input0_vn.getDef()) if input0_vn.getDef() else "None"
+        input1_def_op_str = str(input1_vn.getDef()) if input1_vn.getDef() else "None"
+        # Use the get_varnode_representation from the script for consistent HighVariable display
+        # We are inside resolve_varnode_to_constant, so func_hf and current_prog_ref are in scope.
+        vn_being_resolved_repr = get_varnode_representation(vn_to_resolve, func_hf, current_prog_ref)
+
+        println_func("          [CONST_RESOLVE_DEBUG] %s for %s." % (op_mnemonic, vn_being_resolved_repr))
+        println_func("              Input0 Raw VN: %s, Def: %s, HV_Rep: %s" % 
+                     (input0_vn.toString(), input0_def_op_str, get_varnode_representation(input0_vn, func_hf, current_prog_ref)))
+        println_func("              Input1 Raw VN: %s, Def: %s, HV_Rep: %s" % 
+                     (input1_vn.toString(), input1_def_op_str, get_varnode_representation(input1_vn, func_hf, current_prog_ref)))
+        # --- End Enhanced Debug Prints ---
+
         val0 = resolve_varnode_to_constant(input0_vn, func_hf, current_prog_ref, println_func, max_depth - 1, _visited_vns_for_resolve.copy())
         if val0 is not None:
             val1 = resolve_varnode_to_constant(input1_vn, func_hf, current_prog_ref, println_func, max_depth - 1, _visited_vns_for_resolve.copy())
             if val1 is not None:
                 result = (val0 + val1) & 0xFFFFFFFFFFFFFFFF 
-                println_func("            [CONST_RESOLVE_DEBUG] %s result for %s: (%#x) + (%#x) = %#x" % (op_mnemonic, vn_repr_for_debug, val0, val1, result))
+                println_func("            [CONST_RESOLVE_DEBUG] %s result for %s: (%#x) + (%#x) = %#x" % (op_mnemonic, vn_being_resolved_repr, val0, val1, result))
                 return result
             else:
-                println_func("            [CONST_RESOLVE_DEBUG] %s Input1 (%s) for %s did not resolve to constant." % (op_mnemonic, get_varnode_representation(input1_vn, func_hf, current_prog_ref), vn_repr_for_debug))
+                println_func("            [CONST_RESOLVE_DEBUG] %s Input1 (%s) for %s did not resolve to constant." % (op_mnemonic, get_varnode_representation(input1_vn, func_hf, current_prog_ref), vn_being_resolved_repr))
         else:
-            println_func("            [CONST_RESOLVE_DEBUG] %s Input0 (%s) for %s did not resolve to constant." % (op_mnemonic, get_varnode_representation(input0_vn, func_hf, current_prog_ref), vn_repr_for_debug))
+            println_func("            [CONST_RESOLVE_DEBUG] %s Input0 (%s) for %s did not resolve to constant." % (op_mnemonic, get_varnode_representation(input0_vn, func_hf, current_prog_ref), vn_being_resolved_repr))
     
     elif op_mnemonic == "PTRSUB" or op_mnemonic == "INT_SUB": 
         input0_vn = def_op.getInput(0)
@@ -1142,45 +1294,93 @@ def find_and_report_vtable_assignment(
         alloc_call_op.getSeqnum()
     ))
 
-    equivalent_obj_ptr_vns = {obj_ptr_direct_vn}
-    alloc_call_output_vn = alloc_call_op.getOutput()
-    if alloc_call_output_vn:
-        equivalent_obj_ptr_vns.add(alloc_call_output_vn)
+    # --- Start of new recursive vtable scan logic ---
+    return scan_for_vtable_store_recursive(obj_ptr_hv, alloc_call_op.getSeqnum(), func_where_alloc_hf, 
+                                           original_target_info_for_report, println_func, 
+                                           current_prog_ref_of_alloc_func, 0) # Start with depth 0
 
-    ops_iterator = func_where_alloc_hf.getPcodeOps()
-    found_alloc_call = False
+# --- Renamed and enhanced recursive vtable scanning function ---
+MAX_VTABLE_SCAN_DEPTH = 2 # Max depth for scanning into constructors/initializers
+
+def scan_for_vtable_store_recursive(
+    current_obj_ptr_hv, # HighVariable of the object pointer being scanned
+    start_after_seqnum, # PcodeOp.SeqNum after which to start scanning (e.g., after allocator or previous relevant op)
+    current_scan_hf,    # HighFunction where the scan is currently happening
+    original_target_info_for_report,
+    println_func,
+    current_prog_ref,   # Program reference for the current_scan_hf
+    current_depth       # Current recursion depth
+    ):
+    vtable_results = []
+    current_obj_ptr_direct_vn = current_obj_ptr_hv.getRepresentative() if current_obj_ptr_hv else None
+
+    if not current_obj_ptr_direct_vn:
+        println_func("      [VTABLE_SCAN_REC depth=%d] Error: Object pointer HV %s has no representative. Cannot scan in %s." % 
+                     (current_depth, current_obj_ptr_hv.getName() if current_obj_ptr_hv else "<UnknownHV>", current_scan_hf.getFunction().getName()))
+        return vtable_results
+
+    if current_depth > MAX_VTABLE_SCAN_DEPTH:
+        println_func("      [VTABLE_SCAN_REC depth=%d] Max scan depth reached for %s in %s. Stopping this path." % 
+                     (current_depth, get_varnode_representation(current_obj_ptr_hv, current_scan_hf, current_prog_ref), current_scan_hf.getFunction().getName()))
+        return vtable_results
+
+    println_func("      [VTABLE_SCAN_REC depth=%d] Scanning for obj %s in %s, after seq %s" % (
+        current_depth, get_varnode_representation(current_obj_ptr_hv, current_scan_hf, current_prog_ref), 
+        current_scan_hf.getFunction().getName(), start_after_seqnum
+    ))
+
+    equivalent_obj_ptr_vns = {current_obj_ptr_direct_vn}
+    # If current_obj_ptr_hv is from a CALL output (like initial allocation), add that output varnode too.
+    # This is more relevant for the initial call to this function.
+    # For deeper calls, current_obj_ptr_hv will be a parameter.
+    obj_def_op = current_obj_ptr_direct_vn.getDef() if current_obj_ptr_direct_vn else None
+    if obj_def_op and obj_def_op.getMnemonic() == "CALL" and obj_def_op.getOutput():
+         if obj_def_op.getOutput().equals(current_obj_ptr_direct_vn):
+            equivalent_obj_ptr_vns.add(obj_def_op.getOutput())
+    # Also consider the HighVariable's representative itself if it's different from what might be in equivalent_obj_ptr_vns
+    # This set tracks all varnodes that represent our target object pointer in the current function scope.
+
+    ops_iterator = current_scan_hf.getPcodeOps()
+    found_start_op = False if start_after_seqnum else True # If no start_after_seqnum, scan from beginning (e.g. in constructor)
+
     while ops_iterator.hasNext():
         pcode_op = ops_iterator.next()
 
-        if not found_alloc_call:
-            if pcode_op.getSeqnum().equals(alloc_call_op.getSeqnum()):
-                found_alloc_call = True
+        if not found_start_op:
+            if pcode_op.getSeqnum().equals(start_after_seqnum):
+                found_start_op = True
             continue 
 
+        # Track aliases of the object pointer (e.g., x1 = x0 where x0 is obj_ptr)
         current_op_output_vn = pcode_op.getOutput()
         if current_op_output_vn:
-            op_mnemonic = pcode_op.getMnemonic()
-            if op_mnemonic == "COPY" or op_mnemonic == "CAST":
+            op_mnemonic_alias = pcode_op.getMnemonic()
+            if op_mnemonic_alias == "COPY" or op_mnemonic_alias == "CAST":
                 input_vn_for_copy_cast = pcode_op.getInput(0)
                 if input_vn_for_copy_cast in equivalent_obj_ptr_vns:
                     if current_op_output_vn not in equivalent_obj_ptr_vns:
+                        println_func("        [VTABLE_SCAN_REC depth=%d] Adding alias for obj_ptr: %s = %s (%s)" % 
+                                     (current_depth, get_varnode_representation(current_op_output_vn, current_scan_hf, current_prog_ref), 
+                                      get_varnode_representation(input_vn_for_copy_cast, current_scan_hf, current_prog_ref), op_mnemonic_alias))
                         equivalent_obj_ptr_vns.add(current_op_output_vn)
-
+        
+        # 1. Check for direct STORE to offset 0 of the object pointer
         if pcode_op.getMnemonic() == "STORE":
             stored_to_addr_vn = pcode_op.getInput(1) 
             value_stored_vn = pcode_op.getInput(2)   
             base_being_stored_to = None
+            offset_from_base = 0 # We are looking for store to offset 0
 
+            # Is it a direct store to one of our known object pointer varnodes?
             if stored_to_addr_vn in equivalent_obj_ptr_vns:
                 base_being_stored_to = stored_to_addr_vn
             else:
+                # Is it a store to obj_ptr + 0 ?
                 addr_def_op = stored_to_addr_vn.getDef()
                 if addr_def_op:
                     def_op_mnemonic = addr_def_op.getMnemonic()
-                    if def_op_mnemonic == "COPY":
-                        copied_from_vn = addr_def_op.getInput(0)
-                        if copied_from_vn in equivalent_obj_ptr_vns:
-                            base_being_stored_to = copied_from_vn
+                    if def_op_mnemonic == "COPY" and addr_def_op.getInput(0) in equivalent_obj_ptr_vns:
+                        base_being_stored_to = addr_def_op.getInput(0)
                     elif def_op_mnemonic in ["INT_ADD", "PTRADD"]:
                         add_in0 = addr_def_op.getInput(0)
                         add_in1 = addr_def_op.getInput(1)
@@ -1190,62 +1390,199 @@ def find_and_report_vtable_assignment(
                             base_being_stored_to = add_in1
             
             if base_being_stored_to is not None: 
-                vtable_ptr_candidate_repr = get_varnode_representation(value_stored_vn, func_where_alloc_hf, current_prog_ref_of_alloc_func)
-                println_func("          >>> Potential VTABLE Assignment Found at %s <<<" % pcode_op.getSeqnum().getTarget())
+                # This is a STORE to our object pointer (or obj_ptr + 0)
+                vtable_ptr_candidate_repr = get_varnode_representation(value_stored_vn, current_scan_hf, current_prog_ref)
+                println_func("          [VTABLE_SCAN_REC depth=%d] >>> Potential VTABLE Assignment Found at %s in %s <<<" % 
+                             (current_depth, pcode_op.getSeqnum().getTarget(), current_scan_hf.getFunction().getName()))
                 println_func("              STORE Op: %s" % pcode_op)
-                println_func("              Object Pointer (from Alloc): %s" % get_varnode_representation(obj_ptr_hv, func_where_alloc_hf, current_prog_ref_of_alloc_func))
-                println_func("              Stored-to Address (derived): %s" % get_varnode_representation(base_being_stored_to, func_where_alloc_hf, current_prog_ref_of_alloc_func))
+                println_func("              Object Pointer (current scan target HV): %s" % get_varnode_representation(current_obj_ptr_hv, current_scan_hf, current_prog_ref))
+                println_func("              Actual Addr_VN in STORE (Input 1): %s" % get_varnode_representation(stored_to_addr_vn, current_scan_hf, current_prog_ref))
                 println_func("              VTable Pointer Candidate (raw): %s" % vtable_ptr_candidate_repr)
 
-                vtable_address_details_str = "Not a direct constant or resolvable"
-                resolved_numerical_value = None 
-                
-                resolved_const_addr = resolve_varnode_to_constant(
-                    value_stored_vn, 
-                    func_where_alloc_hf, 
-                    current_prog_ref_of_alloc_func,
-                    dprint 
+                resolved_numerical_value = resolve_varnode_to_constant(
+                    value_stored_vn, current_scan_hf, current_prog_ref, dprint # Use dprint for const_resolve debug
                 )
-
-                if resolved_const_addr is not None:
-                    vtable_address_details_str = "Resolved Constant Addr: %#x" % resolved_const_addr
-                    resolved_numerical_value = resolved_const_addr
+                println_func("              VTable Pointer Candidate (resolved): %#x" % resolved_numerical_value if resolved_numerical_value is not None else "              VTable Pointer Candidate (resolved): None")
                 
-                elif value_stored_vn.isConstant(): 
-                    const_val = value_stored_vn.getOffset()
-                    vtable_address_details_str = "Direct Constant Addr: %#x" % const_val
-                    resolved_numerical_value = const_val
-
-                elif value_stored_vn.getAddress() and value_stored_vn.getAddress().isMemoryAddress():
-                    mem_addr = value_stored_vn.getAddress()
-                    vtable_address_details_str = "Global Addr: %s" % mem_addr.toString()
-                    resolved_numerical_value = mem_addr.getOffset()
-                else:
-                    vtable_address_details_str = "Not a direct constant, resolvable memory address, or known global"
-
-
+                vtable_address_details_str = "Resolved Constant Addr: %#x" % resolved_numerical_value if resolved_numerical_value is not None else "Not a direct constant or resolvable"
+                
                 vtable_results.append({
                     "source_type": "VTABLE_ADDRESS_FOUND",
                     "address": pcode_op.getSeqnum().getTarget().toString(),
                     "pcode_op_str": str(pcode_op),
-                    "function_name": func_where_alloc_hf.getFunction().getName(),
-                    "object_instance_repr": get_varnode_representation(obj_ptr_hv, func_where_alloc_hf, current_prog_ref_of_alloc_func),
+                    "function_name": current_scan_hf.getFunction().getName(),
+                    "object_instance_repr": get_varnode_representation(current_obj_ptr_hv, current_scan_hf, current_prog_ref),
                     "vtable_pointer_raw_repr": vtable_ptr_candidate_repr,
                     "vtable_address_details": vtable_address_details_str,
-                    "resolved_vtable_address_value": resolved_numerical_value, # Store the raw number
-                    "details": "VTable pointer assigned to newly allocated object.",
+                    "resolved_vtable_address_value": resolved_numerical_value,
+                    "details": "VTable pointer assigned to object (depth %d)." % current_depth,
                     "original_target_info": original_target_info_for_report,
                     "str_address": original_target_info_for_report.get("str_address"),
                     "str_instr": original_target_info_for_report.get("str_instr"),
                     "initial_xi_repr": original_target_info_for_report.get("initial_xi_repr")
                 })
-                return vtable_results # Return as soon as the first vtable assignment is found and processed
+                return vtable_results # Return as soon as the first vtable assignment is found for this object in this function
 
+        # 2. If no direct STORE found yet, check for CALLs that might be constructors/initializers
+        if pcode_op.getMnemonic() in ["CALL", "CALLIND"] and not vtable_results:
+            # Check if the first argument to the call is our object pointer
+            if pcode_op.getNumInputs() > 1:
+                first_arg_vn = pcode_op.getInput(1) # Arg0 (often 'this' pointer)
+                if first_arg_vn in equivalent_obj_ptr_vns:
+                    println_func("        [VTABLE_SCAN_REC depth=%d] Found CALL with obj_ptr as 1st arg: %s at %s in %s" % 
+                                 (current_depth, pcode_op, pcode_op.getSeqnum().getTarget(), current_scan_hf.getFunction().getName()))
+                    
+                    call_target_addr_vn = pcode_op.getInput(0)
+                    target_func_obj = None
+                    
+                    # --- MODIFIED FUNCTION RESOLUTION LOGIC ---
+                    target_func_addr = call_target_addr_vn.getAddress() # Directly get the address from the Varnode
+
+                    # Debug prints to understand the call_target_addr_vn
+                    println_func("          [VTABLE_SCAN_REC depth=%d] Call Target PCodeOp Input(0) VN: %s" % (current_depth, call_target_addr_vn.toString()))
+                    println_func("          [VTABLE_SCAN_REC depth=%d]   VN.isAddress(): %s, VN.isConstant(): %s, VN.isRegister(): %s, VN.isUnique(): %s" % 
+                                 (current_depth, call_target_addr_vn.isAddress(), call_target_addr_vn.isConstant(), call_target_addr_vn.isRegister(), call_target_addr_vn.isUnique()))
+                    if target_func_addr:
+                        println_func("          [VTABLE_SCAN_REC depth=%d]   Extracted Address object: %s (Offset: %#x, Space: %s)" % 
+                                     (current_depth, target_func_addr.toString(), target_func_addr.getOffset(), target_func_addr.getAddressSpace().getName()))
+                    else:
+                        println_func("          [VTABLE_SCAN_REC depth=%d]   call_target_addr_vn.getAddress() returned None." % current_depth)
+                    # --- END MODIFIED FUNCTION RESOLUTION LOGIC ---
+
+                    if target_func_addr: # Check if a valid Address object was obtained
+                        println_func("          [VTABLE_SCAN_REC depth=%d] Attempting to get function at resolved address %s (from VN %s) in program %s" % 
+                                     (current_depth, target_func_addr.toString(), call_target_addr_vn.toString(), current_prog_ref.getName()))
+                        target_func_obj = current_prog_ref.getFunctionManager().getFunctionAt(target_func_addr)
+                        if not target_func_obj: # Try with getFunctionContaining as a fallback
+                            println_func("            [VTABLE_SCAN_REC depth=%d] getFunctionAt failed for %s. Trying getFunctionContaining..." % (current_depth, target_func_addr.toString()))
+                            target_func_obj = current_prog_ref.getFunctionManager().getFunctionContaining(target_func_addr)
+                            if target_func_obj:
+                                println_func("            [VTABLE_SCAN_REC depth=%d] getFunctionContaining succeeded for %s: %s" % (current_depth, target_func_addr.toString(), target_func_obj.getName()))
+                    
+                    if target_func_obj:
+                        # Ensure we are not recursing into the same function if it's a direct call to self (simple check)
+                        # A more robust check would involve the full call signature if needed.
+                        if target_func_obj.equals(current_scan_hf.getFunction()):
+                            println_func("          Skipping recursive call to self %s for vtable scan." % target_func_obj.getName())
+                        else:
+                            callee_hf = get_high_function(target_func_obj, target_func_obj.getProgram()) # Use target_func_obj's program
+                            if callee_hf:
+                                first_param_hv_callee = None
+                                callee_function_obj = callee_hf.getFunction()
+                                callee_prog_ref = callee_function_obj.getProgram() # Program context for the callee
+
+                                param_obj = None
+                                if callee_function_obj.getParameterCount() > 0:
+                                    param_obj = callee_function_obj.getParameter(0)
+                                
+                                if param_obj:
+                                    println_func("            [VTABLE_SCAN_REC depth=%d] Callee %s: Found param_obj for index 0: %s (Name: %s, Type: %s)" % 
+                                         (current_depth, callee_function_obj.getName(), param_obj, param_obj.getName(), param_obj.getDataType().getName()))
+                                    
+                                    # Attempt 1: Directly from Parameter object's HighVariable
+                                    try:
+                                        hv = param_obj.getHighVariable()
+                                        if hv:
+                                            first_param_hv_callee = hv
+                                            println_func("              SUCCESS (Method 1): Got HV for %s param 0 via param_obj.getHighVariable(): %s" % 
+                                                         (callee_function_obj.getName(), get_varnode_representation(first_param_hv_callee, callee_hf, callee_prog_ref)))
+                                    except Exception as e_param_direct:
+                                        println_func("              EXCEPTION (Method 1): param_obj.getHighVariable() failed for %s: %s" % (param_obj.getName(), str(e_param_direct)))
+
+                                    # Attempt 2: Via Parameter object's storage
+                                    if not first_param_hv_callee:
+                                        println_func("              ATTEMPTING (Method 2): Get HV via param storage for %s." % param_obj.getName())
+                                        try:
+                                            storage = param_obj.getVariableStorage()
+                                            if storage and not storage.isBadStorage() and storage.size() > 0:
+                                                first_storage_vn = param_obj.getFirstStorageVarnode()
+                                                if first_storage_vn:
+                                                    hv_from_storage = callee_hf.getHighVariable(first_storage_vn)
+                                                    if hv_from_storage:
+                                                        first_param_hv_callee = hv_from_storage
+                                                        println_func("                  SUCCESS (Method 2): Got HV for %s param 0 via first_storage_vn: %s" % 
+                                                                     (callee_function_obj.getName(), get_varnode_representation(first_param_hv_callee, callee_hf, callee_prog_ref)))
+                                        except Exception as e_param_storage:
+                                            println_func("                EXCEPTION (Method 2): Error getting HV via param storage for %s: %s" % (param_obj.getName(), str(e_param_storage)))
+                                    
+                                    # Attempt 3: Via Parameter object's symbol
+                                    if not first_param_hv_callee:
+                                        println_func("              ATTEMPTING (Method 3): Get HV via param symbol for %s." % param_obj.getName())
+                                        try:
+                                            sym = param_obj.getSymbol()
+                                            if sym:
+                                                hv_from_sym = sym.getHighVariable()
+                                                if hv_from_sym:
+                                                    first_param_hv_callee = hv_from_sym
+                                                    println_func("                SUCCESS (Method 3): Got HV for %s param 0 via symbol.getHighVariable(): %s" % 
+                                                                 (callee_function_obj.getName(), get_varnode_representation(first_param_hv_callee, callee_hf, callee_prog_ref)))
+                                        except Exception as e_param_sym:
+                                            println_func("                EXCEPTION (Method 3): Error getting HV via param symbol for %s: %s" % (param_obj.getName(), str(e_param_sym)))
+                                else: # No param_obj (either count is 0 or getParameter(0) failed)
+                                    println_func("            [VTABLE_SCAN_REC depth=%d] Callee %s: No param_obj for index 0 (Count: %d). Will attempt register-based fallback." % 
+                                                 (current_depth, callee_function_obj.getName(), callee_function_obj.getParameterCount()))
+
+                                # --- Fallback logic: If all above methods failed for param_obj or if no param_obj from start ---
+                                if not first_param_hv_callee:
+                                    println_func("            [VTABLE_SCAN_REC depth=%d] All standard methods failed for param 0 HV in %s. Attempting register-based fallback." % 
+                                                 (current_depth, callee_function_obj.getName()))
+                                    default_first_param_reg_name = "x0" # Common for ARM64
+                                    reg_for_fallback = callee_prog_ref.getRegister(default_first_param_reg_name)
+
+                                    if reg_for_fallback:
+                                        # Iterate through symbols in the callee's HighFunction to find a parameter symbol matching the register
+                                        local_symbols_map = callee_hf.getLocalSymbolMap()
+                                        symbols_iterator = local_symbols_map.getSymbols()
+                                        found_fallback_hv = False
+                                        while symbols_iterator.hasNext():
+                                            sym_callee = symbols_iterator.next()
+                                            if sym_callee.isParameter():
+                                                try:
+                                                    storage_callee = sym_callee.getStorage()
+                                                    if storage_callee and storage_callee.isRegisterStorage() and storage_callee.getRegister().equals(reg_for_fallback):
+                                                        hv_cand = sym_callee.getHighVariable()
+                                                        if hv_cand:
+                                                            first_param_hv_callee = hv_cand
+                                                            println_func("              FALLBACK SUCCESS: Got HV for %s param 0 (via %s symbol '%s'): %s" % 
+                                                                         (callee_function_obj.getName(), default_first_param_reg_name, sym_callee.getName(), get_varnode_representation(first_param_hv_callee, callee_hf, callee_prog_ref)))
+                                                            found_fallback_hv = True; break
+                                                except Exception as e_fallback_sym:
+                                                    println_func("              FALLBACK EXCEPTION iterating symbol '%s': %s" % (sym_callee.getName(), str(e_fallback_sym)))
+                                        if not found_fallback_hv:
+                                             println_func("              FALLBACK FAILED: Could not find HighVariable for register %s in %s via parameter symbols." % (default_first_param_reg_name, callee_function_obj.getName()))
+                                    else:
+                                        println_func("              FALLBACK FAILED: Register '%s' not found in program %s. Cannot attempt fallback." % (default_first_param_reg_name, callee_prog_ref.getName()))
+                                # --- End Fallback Logic ---
+
+                                if first_param_hv_callee:
+                                    println_func("          [VTABLE_SCAN_REC depth=%d] ==> Recursing into callee %s with param HV %s" % 
+                                                 (current_depth, callee_hf.getFunction().getName(), get_varnode_representation(first_param_hv_callee, callee_hf, target_func_obj.getProgram())))
+                                    recursive_results = scan_for_vtable_store_recursive(
+                                        first_param_hv_callee, None, callee_hf, 
+                                        original_target_info_for_report, println_func, 
+                                        target_func_obj.getProgram(), current_depth + 1
+                                    )
+                                    if recursive_results: # If results found in callee, extend and return immediately
+                                        println_func("            [VTABLE_SCAN_REC depth=%d] Results found in recursive call to %s. Returning them." % (current_depth, callee_hf.getFunction().getName()))
+                                        vtable_results.extend(recursive_results)
+                                        return vtable_results # Crucial: if found in callee, we are done for this path.
+                                    else:
+                                        println_func("            [VTABLE_SCAN_REC depth=%d] No results from recursive call to %s." % (current_depth, callee_hf.getFunction().getName()))
+                                else:
+                                    # This log is for when first_param_hv_callee is None *before* attempting recursion
+                                    println_func("          [VTABLE_SCAN_REC depth=%d] FAILED to get HighVariable for first param of %s. Cannot recurse for this call." % (current_depth, callee_hf.getFunction().getName() if callee_hf else target_func_obj.getName()))
+                            else:
+                                println_func("          [VTABLE_SCAN_REC depth=%d] Could not decompile callee %s for recursive vtable scan." % (current_depth, target_func_obj.getName()))
+                    else: # target_func_obj is None
+                        println_func("          [VTABLE_SCAN_REC depth=%d] Could not resolve target function for CALL %s at %s." % (current_depth, pcode_op, pcode_op.getSeqnum().getTarget()))
+
+    # This message should only appear if no direct STORE and no fruitful recursive calls occurred from this function level
     if not vtable_results:
-        println_func("      [VTABLE_SCAN] No vtable assignment STORE found for object %s in %s after op %s." % (
-            get_varnode_representation(obj_ptr_hv, func_where_alloc_hf, current_prog_ref_of_alloc_func),
-            func_where_alloc_hf.getFunction().getName(),
-            alloc_call_op.getMnemonic()
+        println_func("      [VTABLE_SCAN_REC depth=%d] FINAL: No vtable assignment found for object %s in %s (after seq %s, and any recursive calls from here)." % (
+            current_depth,
+            get_varnode_representation(current_obj_ptr_hv, current_scan_hf, current_prog_ref),
+            current_scan_hf.getFunction().getName(),
+            start_after_seqnum if start_after_seqnum else "<start>"
         ))
     return vtable_results
 
@@ -1366,11 +1703,11 @@ def find_specific_str_instructions(target_offset, current_program_ref): # Added 
                 # Filter 2: d#/w# registers for xi (parsed first operand string from assembly)
                 if first_operand_str is not None:
                     parsed_op_lower = first_operand_str.lower() # Convert to lowercase for checking
-                    dprint("  [FilterDebug] Instr: %s, Parsed 1st Operand: \"%s\", Lowercase: \"%s\"" % (instr.toString(), first_operand_str, parsed_op_lower))
+                    #dprint("  [FilterDebug] Instr: %s, Parsed 1st Operand: \"%s\", Lowercase: \"%s\"" % (instr.toString(), first_operand_str, parsed_op_lower))
                     if (len(parsed_op_lower) > 1 and
                         (parsed_op_lower.startswith('d') or parsed_op_lower.startswith('w')) and
                         parsed_op_lower[1:].isdigit()):
-                        dprint("    Skipping STR at %s: Parsed source operand (%s) matches d#/w# pattern." % (instr.getAddress(), first_operand_str))
+                        #dprint("    Skipping STR at %s: Parsed source operand (%s) matches d#/w# pattern." % (instr.getAddress(), first_operand_str))
                         continue
                 else: # Case where first_operand_str could not be parsed (should be rare for valid STR/STUR)
                     dprint("  [FilterDebug] Instr: %s, COULD NOT PARSE 1st Operand from instruction string." % instr.toString())
