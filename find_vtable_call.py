@@ -348,7 +348,7 @@ def trace_variable_origin_backward_recursive(
                                                                global_visited_interproc_states, println_func, current_program_ref,
                                                                original_target_info))
         addr_hv_for_stack_check = addr_vn.getHigh()
-        if addr_hv_for_stack_check and addr_hv_for_stack_check.isStackVariable():
+        if addr_hv_for_stack_check and hasattr(addr_hv_for_stack_check, 'isStackVariable') and addr_hv_for_stack_check.isStackVariable():
             println_func(trace_prefix + "    LOAD is from HighStackVariable: %s. Attempting to find prior STOREs." % addr_hv_for_stack_check.getName())
             prior_store_value_origins = find_prior_stores_to_stack_location(
                 high_func, addr_hv_for_stack_check, defining_op,
